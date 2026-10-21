@@ -596,6 +596,14 @@ class _StyledCardMixin:
         self._ensure_card_style()
         super().showEvent(event)
 
+    def hideEvent(self, event):
+        # カードは隠したあと再利用されるため、マウスが乗ったまま隠れた場合のホバー表示を戻しておく
+        if self.is_hovered:
+            self.is_hovered = False
+            self._update_appearance()
+            self.hover_left.emit(self.item)
+        super().hideEvent(event)
+
 
 def _make_badge(text, object_name, size, parent):
     badge = QLabel(text, parent)

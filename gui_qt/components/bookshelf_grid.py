@@ -386,6 +386,7 @@ class BookshelfGrid(OrnateFrame):
         self._card_cache = OrderedDict()  # item_id -> (signature, card)  ※現在の表示モードのカードのみ。古い順
         self._grid = None                 # 配置の計算結果（_compute_grid）
         self._shown_range = None          # 現在カードを作って表示している範囲 (先頭, 末尾+1)
+        self._cover_generation = {}       # item_id -> 表紙の世代（invalidate_items のたびに増える）
         self.cover_loader = None
         db_path = getattr(db, "db_path", None)
         if db_path:
@@ -418,6 +419,8 @@ class BookshelfGrid(OrnateFrame):
     def invalidate_items(self, item_ids):
         """指定アイテムのカードを次回表示時に作り直す（表紙の差し替えなど、内容の比較で検知できない変更用）"""
         for item_id in item_ids:
+            # 世代を進め、作り直す前に依頼済みだった表紙の読み込み結果を新しいカードが受け取らないようにする
+            self._cover_generation[item_id] = self._cover_generation.get(item_id, 0) + 1
             cached = self._card_cache.get(item_id)
             if cached:
                 self._card_cache[item_id] = (None, cached[1])
@@ -450,6 +453,9 @@ class BookshelfGrid(OrnateFrame):
         card.context_menu_requested.connect(self.card_context_menu_requested.emit)
         card.hover_entered.connect(self._on_card_hover_entered)
         card.hover_left.connect(self._on_card_hover_left)
+        if card.thumb_key:
+            # 表紙の識別子は「元画像の大きさ」なので、同じ大きさの画像への差し替えも区別できるよう世代を加える
+            card.thumb_key = (card.thumb_key, self._cover_generation.get(it[0], 0))
         if it[0] == self.selected_item_id:
             card.set_selected(True)
         return card
