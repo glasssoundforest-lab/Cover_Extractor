@@ -75,8 +75,15 @@ class SystemItemWidget(QFrame):
             self.count_label.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-weight: normal; background: transparent;")
 
     def set_selected(self, selected):
+        if selected == self.is_selected:
+            return
         self.is_selected = selected
         self.update_style()
+
+    def set_count(self, count):
+        if count != self.count:
+            self.count = count
+            self.count_label.setText(str(count))
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -172,6 +179,7 @@ class Sidebar(OrnateFrame):
 
         self.current_system = "すべて"
         self.selected_tags = set()
+        self._tag_entries = None  # 前回 set_tags に渡された一覧（変化がなければ作り直さない）
         self.system_widgets = {}
         self.tag_widgets = {}
 
@@ -261,6 +269,16 @@ class Sidebar(OrnateFrame):
 
     def set_systems(self, system_counts, favorite_count=0, bookmark_count=0):
         """システム一覧、お気に入り件数、しおり件数を更新"""
+        total = sum(system_counts.values())
+        names = ["すべて"] + [s for s in system_counts if s]
+        if names == list(self.system_widgets):
+            # 分類の顔ぶれが同じなら、行を作り直さず件数と選択状態だけ更新する
+            for name, w in self.system_widgets.items():
+                w.set_count(total if name == "すべて" else system_counts[name])
+                w.set_selected(self.current_system == name)
+            self._update_category_buttons(favorite_count, bookmark_count)
+            return
+
         # 既存ウィジェットのクリア
         while self.sys_container.count():
             item = self.sys_container.takeAt(0)
@@ -269,7 +287,6 @@ class Sidebar(OrnateFrame):
         self.system_widgets.clear()
 
         # 1. "すべて" を先頭に追加
-        total = sum(system_counts.values())
         all_item = SystemItemWidget("すべて", total, self.current_system == "すべて")
         all_item.clicked.connect(self._on_category_clicked)
         self.sys_container.addWidget(all_item)
@@ -285,7 +302,10 @@ class Sidebar(OrnateFrame):
             self.sys_container.addWidget(w)
             self.system_widgets[sname] = w
 
-        # 3. お気に入り件数・しおり件数更新
+        self._update_category_buttons(favorite_count, bookmark_count)
+
+    def _update_category_buttons(self, favorite_count, bookmark_count):
+        """お気に入り件数・しおり件数と選択状態を更新"""
         self.fav_button.set_count(favorite_count)
         self.fav_button.set_selected(self.current_system == "__favorite__")
 
@@ -294,6 +314,12 @@ class Sidebar(OrnateFrame):
 
     def set_tags(self, tags):
         """グローバルタグ一覧を更新（長方形短辺丸型ピルボタンスタイル）"""
+        entries = [tuple(t) if isinstance(t, (list, tuple)) else (t,) for t in tags]
+        if entries == self._tag_entries:
+            # 一覧が変わっていなければ作り直さない（選択中のタグの表示もそのまま保たれる）
+            return
+        self._tag_entries = entries
+
         for w in self.tag_widgets.values():
             w.deleteLater()
         self.tag_widgets.clear()
@@ -326,9 +352,19 @@ class Sidebar(OrnateFrame):
                 self.tag_layout.addLayout(row_layout)
 
             pill = PillTag(tname, color=tcolor, is_checkable=True)
+            if tname in self.selected_tags:
+                # 作り直しても選択中の表示を保つ（絞り込みは選択中のまま続いているため）
+                pill.is_checked = True
+                pill._update_style()
             pill.toggled.connect(self._on_tag_toggled)
             row_layout.addWidget(pill)
             self.tag_widgets[tname] = pill
+
+        # 一覧から消えたタグが選択に残っていると、外す手段がないまま絞り込まれ続けるため外す
+        removed = self.selected_tags - set(self.tag_widgets)
+        if removed:
+            self.selected_tags -= removed
+            self.tags_changed.emit(list(self.selected_tags))
 
     def _on_category_clicked(self, key):
         """システム分類・お気に入り・しおりの選択切り替え"""

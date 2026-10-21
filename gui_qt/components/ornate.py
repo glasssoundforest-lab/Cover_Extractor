@@ -109,6 +109,21 @@ class OrnateFrame(QFrame):
         self.bg_pixmap = bg_pixmap
         self.draw_border = draw_border
         self.fit_mode = fit_mode
+        self._bg_cache = None  # (幅, 高さ, 元画像の cacheKey, 拡大縮小済みの背景)
+
+    def _stretched_bg(self, w, h):
+        """枠いっぱいに引き伸ばした背景画像（再描画のたびに拡大縮小しないよう、大きさごとに1度だけ作る）"""
+        key = (w, h, self.bg_pixmap.cacheKey())
+        if self._bg_cache is None or self._bg_cache[:3] != key:
+            scaled = QPixmap(w, h)
+            scaled.fill(Qt.transparent)
+            p = QPainter(scaled)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawPixmap(0, 0, w, h, self.bg_pixmap)
+            p.end()
+            self._bg_cache = key + (scaled,)
+        return self._bg_cache[3]
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -121,7 +136,7 @@ class OrnateFrame(QFrame):
         # 背景画像、または背景色塗りつぶし
         if self.bg_pixmap and not self.bg_pixmap.isNull():
             if self.fit_mode == "stretch":
-                painter.drawPixmap(0, 0, w, h, self.bg_pixmap)
+                painter.drawPixmap(0, 0, self._stretched_bg(w, h))
             else:
                 scaled = self.bg_pixmap.scaled(w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
                 sx = (scaled.width() - w) // 2

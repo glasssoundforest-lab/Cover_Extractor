@@ -5,7 +5,7 @@
 """
 
 from PySide6.QtCore import Qt, QByteArray, QBuffer, QIODevice, Signal, QPoint, QPropertyAnimation, QEasingCurve, QRectF
-from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath
+from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QPalette, QTransform
 from PySide6.QtWidgets import (
     QFrame,
     QVBoxLayout,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QSizePolicy,
     QGraphicsDropShadowEffect,
+    QGraphicsEffect,
 )
 
 from ..theme import Theme
@@ -605,6 +606,51 @@ class _StyledCardMixin:
         super().hideEvent(event)
 
 
+class _CachedDropShadow(QGraphicsDropShadowEffect):
+    """表紙上の文字の影。
+
+    Qt 標準の影は描くたびに文字を描き直してぼかすため、スクロールやホバーのたびに
+    見えているカード全部でぼかし処理が走る。ここでは Qt 自身に1度描かせた結果を覚えておき、
+    文字・色・大きさ・影の設定が変わったときだけ作り直す。
+    """
+
+    def __init__(self, label):
+        super().__init__(label)
+        self._label = label
+        self._key = None
+        self._cache = None  # (影付きの描画結果, 描画位置（ラベル座標）)
+
+    def _state_key(self):
+        label = self._label
+        return (label.text(), label.size(), label.palette().color(QPalette.WindowText).rgba(),
+                label.font().key(), self.blurRadius(), self.color().rgba(), self.offset())
+
+    def draw(self, painter):
+        transform = painter.worldTransform()
+        # 拡大縮小を伴う描画や高 DPI 画面では、標準の描き方に任せる
+        if transform.type().value > QTransform.TxTranslate.value or painter.device().devicePixelRatio() != 1:
+            super().draw(painter)
+            return
+        key = self._state_key()
+        if key != self._key or self._cache is None:
+            offset = QPoint()
+            source = self.sourcePixmap(Qt.DeviceCoordinates, offset, QGraphicsEffect.PadToEffectiveBoundingRect)
+            if source.isNull():
+                return
+            image = QImage(source.size(), QImage.Format_ARGB32_Premultiplied)
+            image.fill(0)
+            p = QPainter(image)
+            # 標準の描き方は画面座標 offset に描くため、その位置が画像の左上に来るようにずらす
+            p.setWindow(offset.x(), offset.y(), image.width(), image.height())
+            super().draw(p)
+            p.end()
+            local = transform.inverted()[0].map(offset)
+            self._cache = (QPixmap.fromImage(image), local)
+            self._key = key
+        pixmap, local = self._cache
+        painter.drawPixmap(local, pixmap)
+
+
 def _make_badge(text, object_name, size, parent):
     badge = QLabel(text, parent)
     badge.setObjectName(object_name)
@@ -730,7 +776,7 @@ class ScenarioCard(_StyledCardMixin, QFrame):
         self.title_label.setTextFormat(Qt.PlainText)
         self.title_label.setWordWrap(True)
         self.title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.title_shadow = QGraphicsDropShadowEffect(self.title_label)
+        self.title_shadow = _CachedDropShadow(self.title_label)
         self.title_shadow.setOffset(1, 1)
         self.title_label.setGraphicsEffect(self.title_shadow)
         overlay_layout.addWidget(self.title_label)
@@ -748,7 +794,7 @@ class ScenarioCard(_StyledCardMixin, QFrame):
         self.meta_label.setObjectName("cardMeta")
         self.meta_label.setTextFormat(Qt.PlainText)
         self.meta_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.meta_shadow = QGraphicsDropShadowEffect(self.meta_label)
+        self.meta_shadow = _CachedDropShadow(self.meta_label)
         self.meta_shadow.setOffset(1, 1)
         self.meta_label.setGraphicsEffect(self.meta_shadow)
         overlay_layout.addWidget(self.meta_label)
