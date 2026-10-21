@@ -1,0 +1,31 @@
+[package]
+name = "cover_extractor"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.88"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["pdf", "web"]
+web = ["dep:ureq"]
+pdf = ["dep:hayro"]
+
+[dependencies]
+thiserror = "2"
+zip = "9"
+walkdir = "2"
+encoding_rs = "0.8"
+unicode-normalization = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+image = "0.25"
+imageproc = "0.25"
+hayro = { version = "0.8", optional = true }
+ureq = { version = "3.4", optional = true }
+
+[dev-dependencies]
+toml = "0.8"

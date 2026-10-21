@@ -1,0 +1,17 @@
+# Rust のビルド出力（cargo build で作り直せる）
+/target/
+/cover_extractor.dll
+
+# Python のキャッシュ
+__pycache__/
+*.pyc
+
+# 個人データ・設定（書架データと、暗号化された Notion トークンを含む設定）
+/catalog.db
+/settings.ini
+
+# テストが作る一時 DB・画像
+*.db
+*.db-journal
+/crop_*.png
+/preview_qt_prototype.png

@@ -1,0 +1,134 @@
+# 表紙判定ルール（既定値）
+#
+# 候補（画像 / PDFの1ページ目）ごとに点数を付け、最も高いものを表紙にする。
+#   点数 = 基本点 + 一致した加点グループの最大値 + 一致した減点グループの最小値
+#          - 階層の深さ × per_depth + 連番ボーナス
+# その後、上位の候補だけ実際に画像を読み、縦横比や「最も多い1色の割合」（白紙・文章ページの検出）で減点する。
+#
+# キーワードの照合方法:
+#   - 英数字のキーワードは「単語」単位で照合する（大文字小文字・全角半角は区別しない）。
+#     `EndCard_GM.png` → end / card / gm、隣り合う2語の連結（endcard / cardgm）とも照合する。
+#     `background` は `back` には一致しない。
+#   - 日本語を含むキーワードは、フォルダ名・ファイル名の部分文字列として照合する。
+#   - 既定ではフォルダ名にも適用する（`trailer/` `NPC/` `room/` のようにフォルダで分類された配布物が多いため）。
+#     `scope = "name"` を付けたグループはファイル名だけで照合する。
+#   - ファイル名の手がかりはフォルダ名より具体的なので優先する。ファイル名がどれかのグループに一致したら、
+#     フォルダ名の一致は無視する（`セッション用素材/トレーラー1.png` の「素材」、`3.盤面カード/ロゴ.png` の「盤面」）。
+#   - `max_per_dir` を付けたグループは、同じフォルダでファイル名が一致した候補がその数を超えると、
+#     命名規則とみなしてそのフォルダでは無視する（カード裏面 `表紙：銀露い.png` … が40枚あるマダミスなど）。
+#
+# このファイルを編集したら、キャッシュは自動的に無効になる（ルールのハッシュがキャッシュキーに入る）。
+
+version = 6
+
+# 最終点数がこれ未満の候補は表紙にしない。
+min_score = -50
+
+[base]
+image = 0
+# PDFの1ページ目。「表紙」と名付けられた画像（+100）には負け、トレーラー画像（+60）には勝つ。
+# ただし白紙に近いページは plain_page で大きく減点され、トレーラー画像より下になる。
+pdf_first_page = 70
+
+[adjust]
+per_depth = 8              # 共通ルートフォルダを除いた階層1段ごとの減点
+sequence_first_bonus = 10  # 連番（_a, _1, 01 …）の先頭への加点
+sequence_later_penalty = 5 # 連番の2枚目以降への減点（1枚ごと、最大4枚分）
+extreme_aspect_ratio = 2.0 # 長辺/短辺がこれを超えたら減点（帯・立ち絵など）
+extreme_aspect_penalty = 40
+plain_dominant_ratio = 0.65 # 最も多い1色がこの割合以上なら「白紙・文章ページ」（背景色は問わない）
+plain_page_penalty = 60
+
+# 判定に迷ったときは、表紙候補を複数返して選んでもらう。
+# 「迷っている」= 1位の点数が低い、または1位と2位の差が小さい。
+[choices]
+min_confident_score = 50 # 1位がこれ未満なら迷っている（ロゴや白紙ページしかない場合など）
+min_margin = 15          # 1位と2位の差がこれ未満なら迷っている
+count = 4                # 選択肢の数（1位を含む）
+per_section = 1          # 同じ区画（最上位フォルダ。`5.エンドカード` など）から先に入れる数。一巡したら制限なし
+browse_floor = -150      # 「その他の候補」に含める下限（素材 -100 は含め、ネタバレ -200 は含めない）
+max_attempts = 16        # 選択肢を集めるときに実際に読む候補の最大数
+
+[[group]]
+name = "cover"
+score = 100
+max_per_dir = 4
+words = [
+  "cover", "hyoushi", "title", "thumbnail", "thumb", "jacket", "package", "keyvisual", "kv",
+  "表紙", "カバー", "タイトル", "サムネ", "ジャケット", "パッケージ", "キービジュアル", "メインビジュアル",
+]
+
+[[group]]
+name = "trailer"
+score = 60
+words = ["trailer", "teaser", "トレーラー", "トレイラー", "ティザー", "告知"]
+
+[[group]]
+name = "header"
+score = 30
+words = ["header", "main", "ヘッダー", "メイン"]
+
+[[group]]
+name = "endcard"
+score = 30
+words = ["endcard", "エンドカード"]
+
+[[group]]
+name = "scenario-document"
+score = 20
+targets = ["pdf"]
+words = ["scenario", "guide", "gm", "gmguide", "シナリオ", "ガイド", "本文", "ゲームマスター"]
+
+# タイトルロゴは、専用の表紙やトレーラーがないときの表紙になる（あやかし夜行奇譚の `ロゴ.png`）。
+# エンドカード（+30）より上、トレーラー（+60）より下。
+# 透過の白文字ロゴなどは、読んだ後に「白紙」として減点される（アンダーテリング.2 の `タイトルロゴ.png`）。
+[[group]]
+name = "logo"
+score = 40
+scope = "name"
+words = ["logo", "ロゴ"]
+
+[[group]]
+name = "handout"
+score = -30
+words = ["handout", "ho", "ハンドアウト"]
+
+# 「アンケート」フォルダの中のエンドカード画像などを巻き込まないよう、ファイル名だけで照合する。
+[[group]]
+name = "readme"
+score = -100
+scope = "name"
+words = [
+  "readme", "read", "license", "terms", "credit", "credits", "changelog", "faq",
+  "はじめに", "お読み", "読んで", "規約", "注意", "クレジット", "更新履歴", "アンケート", "ライセンス",
+]
+
+[[group]]
+name = "material"
+score = -100
+words = [
+  "map", "maps", "npc", "npcs", "room", "rooms", "token", "tokens", "icon", "icons",
+  "back", "background", "bg", "floor", "tile", "tiles", "stand", "standing", "tachie",
+  "cutin", "face", "faces", "stamp", "stamps", "dice", "button", "buttons", "frame", "frames",
+  "effect", "effects", "ui", "sozai", "asset", "assets", "material", "materials", "item", "items",
+  "マップ", "地図", "立ち絵", "立絵", "部屋", "ルーム", "背景", "床", "素材", "トークン", "アイコン",
+  "カットイン", "差分", "表情", "スタンプ", "ダイス", "ボタン", "フレーム", "エフェクト", "駒", "コマ",
+  "盤面", "札",
+]
+
+# エンディングや解説はネタバレになるので、表紙にしない（`03_ending/02_ED.pdf` など）。
+# exclude = true のグループは点数に関係なく常に除外し、選択肢にも「その他の候補」にも出さない
+# （サムネイルを見せること自体がネタバレになるため）。
+[[group]]
+name = "spoiler"
+score = -200
+exclude = true
+words = [
+  "ending", "endings", "ed", "epilogue", "commentary", "afterword", "spoiler", "spoilers", "netabare",
+  "エンディング", "エピローグ", "ネタバレ", "解説", "あとがき", "後書き", "真相", "秘匿",
+]
+
+[[group]]
+name = "room-data"
+score = -100
+words = ["ccfolia", "udonarium", "ココフォリア", "ユドナリウム"]
