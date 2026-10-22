@@ -33,6 +33,11 @@ class NotionSyncWorker(QThread):
         super().__init__(parent)
         self.db_path = getattr(db, "db_path", "catalog.db")
         self.has_diff_receiver = False
+        # 自動同調では比較画面を出さず、手元と Notion が食い違う本は保留する（次回の手動同調で確認できる）
+        self.defer_conflicts = False
+        self.imported_count = 0  # Notion から取り込んだ（手元を更新した）冊数
+        self.pushed_count = 0    # Notion へ送った冊数
+        self.deferred_count = 0  # 食い違いのため保留した冊数
 
     def run(self):
         from core.database import Database
@@ -81,10 +86,16 @@ class NotionSyncWorker(QThread):
                 return
 
             limit_val = app_settings.get_notion_import_limit()
-            query_limit = None if limit_val == 0 else limit_val
-            pages = client.query_all(data_source_id, limit=query_limit)
-            if query_limit is not None and len(pages) > query_limit:
-                pages = pages[:query_limit]
+            import_limit = None if limit_val == 0 else limit_val
+
+            # 前回の同調でどの更新日時まで読み込んだか。分かっていれば、それ以降に更新されたページだけを取得する
+            watermark_key = f"notion_watermark:{data_source_id}"
+            watermark = worker_db.get_sync_state(watermark_key)
+            pages = client.query_all(
+                data_source_id,
+                filter=notion_sync.edited_since_filter(watermark) if watermark else None,
+                sorts=notion_sync.OLDEST_EDIT_FIRST,
+            )
         except Exception as e:
             self.finished_all.emit(0, 0, f"Notionへの接続に失敗しました:\n{e}")
             return
@@ -92,7 +103,12 @@ class NotionSyncWorker(QThread):
         success = 0
         fail = 0
         imported_page_ids = set()
+        fresh_page_ids = set()       # 今回 Notion の内容を手元へ取り込んだページ
         needs_push_page_ids = set()
+        # 取得したが今回は反映していないページ（保留・失敗・件数上限）。Notion 側の変更を上書きしないよう書き戻さない
+        unsettled_page_ids = {p.get("id") for p in pages if p.get("id")}
+        new_watermark = None
+        watermark_blocked = False
 
         # 同期前のローカル状態をスナップショット（ローカルで表紙や項目が更新された既存ページを検知するため）
         pre_local_by_pid = {
@@ -106,6 +122,9 @@ class NotionSyncWorker(QThread):
         for idx, page in enumerate(pages):
             if self.isInterruptionRequested():
                 break
+            # 取り込み件数の上限（実際に手元へ取り込んだ冊数で数える。残りは次回の同調で続きから取り込む）
+            if import_limit is not None and self.imported_count >= import_limit:
+                break
 
             page_id = page.get("id") or f"notion-page-{idx}"
             notion_edit_time = page.get("last_edited_time") or ""
@@ -113,6 +132,7 @@ class NotionSyncWorker(QThread):
             title = vals.get("title") or "無題のシナリオ"
             self.progress.emit(idx + 1, max(1, total_remote), title)
 
+            settled = True  # このページを反映し終えたか（保留・失敗なら False）
             try:
                 # 既存レコードの探索（page_id一致、file_path一致、または同一タイトル）
                 existing = worker_db.find_existing_item_for_notion(
@@ -129,6 +149,7 @@ class NotionSyncWorker(QThread):
                     and existing.get("notion_last_edited_time") == notion_edit_time
                 ):
                     imported_page_ids.add(page_id)
+                    unsettled_page_ids.discard(page_id)
                     success += 1
                     continue
 
@@ -193,14 +214,23 @@ class NotionSyncWorker(QThread):
                     if not has_diff and thumb_bytes and thumb_bytes != curr_dict.get("thumbnail_bytes"):
                         has_diff = True
 
+                    if has_diff and self.defer_conflicts:
+                        self.deferred_count += 1
+                        settled = False
+                        continue
+
                     if has_diff and getattr(self, "has_diff_receiver", False):
                         import queue
                         res_q = queue.Queue()
                         self.request_diff_resolution.emit(curr_dict, notion_dict, (res_q, existing["id"]))
-                        try:
-                            resolution = res_q.get(timeout=300)
-                        except Exception:
-                            resolution = {"action": "apply", "selected_fields": set(notion_dict.keys())}
+                        # 比較画面の回答を待つ（中断されたら、この本は変更せずに飛ばす）
+                        resolution = {"action": "skip"}
+                        while not self.isInterruptionRequested():
+                            try:
+                                resolution = res_q.get(timeout=0.5)
+                                break
+                            except queue.Empty:
+                                pass
 
                         action = resolution.get("action")
                         if action == "apply":
@@ -245,12 +275,17 @@ class NotionSyncWorker(QThread):
                                     thumbnail_bytes=final_thumb,
                                     last_edited_time=notion_edit_time,
                                 )
+                            # 一部だけ採用・その場編集した場合は手元と Notion が食い違うため、
+                            # 「取り込んだばかり」扱いにせず、送った内容との比較で書き戻すかを決める
                             imported_page_ids.add(page_id)
+                            unsettled_page_ids.discard(page_id)
+                            self.imported_count += 1
                             success += 1
                             continue
                         else:
-                            # スキップ選択された場合
+                            # スキップ選択された場合（次回の同調でもう一度確認する）
                             imported_page_ids.add(page_id)
+                            settled = False
                             success += 1
                             continue
 
@@ -261,22 +296,49 @@ class NotionSyncWorker(QThread):
                     last_edited_time=notion_edit_time,
                 )
                 imported_page_ids.add(page_id)
+                fresh_page_ids.add(page_id)
+                unsettled_page_ids.discard(page_id)
+                self.imported_count += 1
                 success += 1
             except Exception as e:
                 print(f"[NotionSync] Error importing page {title}: {e}")
+                settled = False
                 fail += 1
+            finally:
+                # 更新日時の古い順に処理しているため、保留・失敗したページより前までを「読み込み済み」とする
+                if not settled:
+                    watermark_blocked = True
+                elif not watermark_blocked and notion_edit_time:
+                    new_watermark = notion_edit_time
+
+        if new_watermark and (not watermark or new_watermark > watermark):
+            worker_db.set_sync_state(watermark_key, new_watermark)
 
         # 2. ローカル DB にある未同期アイテム（およびローカル変更がある既存アイテム）を Notion テーブル構造に合わせて書き出し
-        items = worker_db.items_for_notion()
-        local_targets = [
-            it
-            for it in items
-            if (it.get("notion_page_id") not in imported_page_ids)
-            or (it.get("notion_page_id") in needs_push_page_ids)
-        ]
+        #    前回 Notion へ送った内容（または Notion と一致を確認した内容）から変わっていないものは送らない
+        local_targets = []
+        for it in worker_db.items_for_notion():
+            page_id = it.get("notion_page_id")
+            export_it = dict(it)
+            if str(export_it.get("file_path") or "").startswith("notion://"):
+                export_it["file_path"] = ""
+            props_hash = notion_sync.properties_hash(notion_sync.build_properties(export_it, mapping, schema))
+            cover_changed = bool(
+                it.get("thumbnail")
+                and notion_sync.compute_cover_hash(it.get("thumbnail")) != it.get("notion_cover_hash")
+            )
+            if page_id in unsettled_page_ids:
+                continue
+            if not page_id or page_id in needs_push_page_ids:
+                local_targets.append((it, export_it, props_hash))
+            elif page_id in fresh_page_ids:
+                # 今回 Notion から取り込んだばかりで、手元と Notion が一致している
+                worker_db.set_notion_sync_state(it["id"], props_hash)
+            elif props_hash != it.get("notion_sync_hash") or (cover_changed and page_id not in imported_page_ids):
+                local_targets.append((it, export_it, props_hash))
         total_all = total_remote + len(local_targets)
 
-        for idx, it in enumerate(local_targets):
+        for idx, (it, export_it, props_hash) in enumerate(local_targets):
             if self.isInterruptionRequested():
                 break
 
@@ -284,10 +346,6 @@ class NotionSyncWorker(QThread):
             self.progress.emit(total_remote + idx + 1, max(1, total_all), title)
 
             try:
-                export_it = dict(it)
-                if str(export_it.get("file_path") or "").startswith("notion://"):
-                    export_it["file_path"] = ""
-
                 page_id = it.get("notion_page_id")
                 thumb_bytes = it.get("thumbnail")
                 new_cover_hash = notion_sync.compute_cover_hash(thumb_bytes)
@@ -307,14 +365,15 @@ class NotionSyncWorker(QThread):
                 )
 
                 if page_id:
-                    client.update_page(page_id, properties=props, cover_upload_id=cover_upload_id)
+                    updated = client.update_page(page_id, properties=props, cover_upload_id=cover_upload_id)
                     if cover_upload_id and new_cover_hash:
                         worker_db.set_notion_link(it["id"], page_id, cover_hash=new_cover_hash)
                     if page_id not in imported_page_ids:
                         success += 1
+                    self.pushed_count += 1
                 else:
-                    new_page = client.create_page(data_source_id, props, cover_upload_id=cover_upload_id)
-                    new_pid = new_page.get("id")
+                    updated = client.create_page(data_source_id, props, cover_upload_id=cover_upload_id)
+                    new_pid = updated.get("id")
                     if new_pid:
                         worker_db.set_notion_link(
                             it["id"],
@@ -322,11 +381,40 @@ class NotionSyncWorker(QThread):
                             cover_hash=new_cover_hash if cover_upload_id else old_cover_hash,
                         )
                     success += 1
+                    self.pushed_count += 1
+                # 送った内容と、送った結果の Notion 側の更新日時を記録する
+                # （次回の同期で、自分で書き込んだページを「Notion 側で更新された」と取り違えて読み直さないため）
+                worker_db.set_notion_sync_state(it["id"], props_hash, (updated or {}).get("last_edited_time"))
             except Exception as e:
                 print(f"[NotionSync] Error syncing item {title}: {e}")
                 fail += 1
 
+        client.close()
         self.finished_all.emit(success, fail, "")
+
+
+def resolve_notion_diff(parent, db, current_dict, notion_dict, queue_and_id):
+    """Notionと手元データで同一または更新がある場合の比較選択ダイアログを表示し、結果を同調処理へ返す"""
+    res_q, item_id = queue_and_id
+    from .web_info_diff_dialog import WebInfoComparisonDialog
+
+    dlg = WebInfoComparisonDialog(
+        current_dict,
+        notion_dict,
+        parent=parent,
+        source_name="Notion",
+        db=db,
+        item_id=item_id,
+    )
+    if dlg.exec() == QDialog.Accepted:
+        res_q.put({
+            "action": "apply",
+            "selected_fields": dlg.get_selected_fields(),
+            "edited_values": dlg.get_edited_values(),
+            "edited_in_detail": getattr(dlg, "edited_in_detail", False),
+        })
+    else:
+        res_q.put({"action": "skip"})
 
 
 class NotionSyncDialog(QDialog):
@@ -437,27 +525,7 @@ class NotionSyncDialog(QDialog):
         self.worker.start()
 
     def _on_request_diff_resolution(self, current_dict, notion_dict, queue_and_id):
-        """Notionと手元データで同一または更新がある場合の比較選択ダイアログを表示"""
-        res_q, item_id = queue_and_id
-        from .web_info_diff_dialog import WebInfoComparisonDialog
-
-        dlg = WebInfoComparisonDialog(
-            current_dict,
-            notion_dict,
-            parent=self,
-            source_name="Notion",
-            db=self.db,
-            item_id=item_id,
-        )
-        if dlg.exec() == QDialog.Accepted:
-            res_q.put({
-                "action": "apply",
-                "selected_fields": dlg.get_selected_fields(),
-                "edited_values": dlg.get_edited_values(),
-                "edited_in_detail": getattr(dlg, "edited_in_detail", False),
-            })
-        else:
-            res_q.put({"action": "skip"})
+        resolve_notion_diff(self, self.db, current_dict, notion_dict, queue_and_id)
 
     def _on_progress(self, current, total, title):
         self.pbar.setMaximum(total)

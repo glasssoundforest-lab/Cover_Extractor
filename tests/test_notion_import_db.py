@@ -617,7 +617,7 @@ class TestNotionImportToDB(unittest.TestCase):
         self.assertEqual(len(imported_ids), 10)
 
     def test_09_notion_sync_worker_limits_import_to_10(self):
-        """NotionSyncWorker が Notion からの取り込み時に limit=10 を指定して最大10件に限定すること"""
+        """NotionSyncWorker が Notion から1回に取り込む冊数を上限の10件に限定すること（残りは次回に続きから取り込む）"""
         from gui_qt.dialogs.notion_sync_dialog import NotionSyncWorker
 
         app_settings.save(
@@ -651,15 +651,17 @@ class TestNotionImportToDB(unittest.TestCase):
             worker.finished_all.connect(lambda s, f, err: results.append((s, f, err)))
             worker.run()
 
-            # query_all が limit=10 で呼ばれていること
-            instance.query_all.assert_called_with("src_1", limit=10)
+            # 取得は件数で打ち切らず（初回は更新日時の絞り込みなし）、取り込む冊数を上限で打ち切ること
+            _, kwargs = instance.query_all.call_args
+            self.assertNotIn("limit", kwargs)
+            self.assertIsNone(kwargs.get("filter"))
             self.assertEqual(len(results), 1)
             # 15件返されても最大10件のみインポートされること
             self.assertEqual(results[0][0], 10)
             self.assertEqual(len(isolated_db.get_items()), 10)
 
     def test_10_notion_import_limit_setting_and_unlimited_zero(self):
-        """Notion取り込み件数設定で0を指定した際に無制限(limit=None)としてクエリされること"""
+        """Notion取り込み件数設定で0を指定した際に、取得・取り込みとも件数で打ち切らないこと"""
         from gui_qt.dialogs.notion_sync_dialog import NotionSyncWorker
 
         app_settings.save(
@@ -682,8 +684,9 @@ class TestNotionImportToDB(unittest.TestCase):
             worker = NotionSyncWorker(isolated_db)
             worker.run()
 
-            # limit=0 のときは query_all に limit=None（無制限）が渡されること
-            instance.query_all.assert_called_with("src_1", limit=None)
+            # limit=0 のときは件数で打ち切らずに取得すること
+            _, kwargs = instance.query_all.call_args
+            self.assertIsNone(kwargs.get("limit"))
 
     def test_11_notion_sync_worker_skip_same_last_edited_time(self):
         """NotionページとDBの notion_last_edited_time が同一の場合は更新処理がスキップされること"""

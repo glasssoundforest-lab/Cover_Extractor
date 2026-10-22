@@ -64,6 +64,7 @@ class MainWindow(QMainWindow):
     extractor_loaded = Signal(object, bool)  # (RustDllExtractor または None, 読み込めたか)
 
     SEARCH_DEBOUNCE_MS = 200  # 検索欄の入力が止まってから絞り込むまでの待ち時間
+    AUTO_SYNC_STARTUP_DELAY_MS = 8000  # 自動同調が有効なとき、起動してから最初に同調するまでの待ち時間
 
     def __init__(self, db_path="catalog.db"):
         super().__init__()
@@ -74,6 +75,12 @@ class MainWindow(QMainWindow):
 
         # バックエンド初期化
         self.db = Database(db_path)
+        self._notion_worker = None  # バックグラウンドで動いている Notion との同調
+        self._auto_sync_timer = QTimer(self)
+        self._auto_sync_timer.timeout.connect(lambda: self._start_notion_sync(auto=True))
+        self._auto_sync_kickoff = QTimer(self)  # 起動直後の1回目
+        self._auto_sync_kickoff.setSingleShot(True)
+        self._auto_sync_kickoff.timeout.connect(lambda: self._start_notion_sync(auto=True))
         # Rust エンジン（DLL）は別スレッドで読み込む。DLL が無い場合はソースからのビルドに数分かかるため、
         # 画面の表示を待たせない。rust_ok は読み込み中 None、成功 True、失敗 False。
         self._extractor = None
@@ -112,6 +119,7 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._init_window_geometry()
         self.reload_data()
+        self._apply_auto_sync_settings(at_startup=True)
 
     def _init_ui(self):
         from PySide6.QtGui import QPixmap
@@ -177,6 +185,7 @@ class MainWindow(QMainWindow):
 
         # 3. 下部ステータスバー
         self.status_bar = StatusBar(self)
+        self.status_bar.sync_cancel_requested.connect(self._on_notion_sync_cancel)
         main_layout.addWidget(self.status_bar)
 
         # 4. ショートカットキー初期化
@@ -501,6 +510,7 @@ class MainWindow(QMainWindow):
         from .dialogs.settings_dialog import SettingsDialog
         dlg = SettingsDialog(self.db, self)
         dlg.settings_saved.connect(self._init_shortcuts)
+        dlg.settings_saved.connect(self._apply_auto_sync_settings)
         dlg.tags_changed.connect(self.reload_data)
         dlg.exec()
         # バックアップからの復元で表紙が入れ替わった場合に備え、カードを作り直す
@@ -508,22 +518,85 @@ class MainWindow(QMainWindow):
         self.reload_data()
 
     def _on_notion_sync_requested(self):
-        """Notion書架との非同期同調（同期）処理"""
-        from .dialogs.notion_sync_dialog import NotionSyncDialog
-        dlg = NotionSyncDialog(self.db, self)
-        dlg.exec()
+        """Notion書架との同調をバックグラウンドで始める（同調中も書架はそのまま使える）"""
+        self._start_notion_sync(auto=False)
 
-        if dlg.error_message:
-            QMessageBox.warning(self, "Notion同調エラー", dlg.error_message)
+    def _start_notion_sync(self, auto=False):
+        """Notion との同調を別スレッドで始める。
+
+        auto=True（自動同調）のときは、手元と Notion が食い違う本があっても比較画面を出さずに保留し、
+        接続できない等のエラーもダイアログを出さずにステータスバーへ表示するだけにする。
+        """
+        if self._notion_worker is not None and self._notion_worker.isRunning():
+            if not auto:
+                self.status_bar.show_sync_message("Notion との同調はすでに実行中です", 3000)
+            return
+        from .dialogs.notion_sync_dialog import NotionSyncWorker, resolve_notion_diff
+
+        worker = NotionSyncWorker(self.db, self)
+        label = "Notion と自動同調中" if auto else "Notion と同調中"
+        worker.progress.connect(
+            lambda current, total, title: self.status_bar.show_sync_progress(
+                current, total, f"{label}（{current}/{total}）: 『{title}』"
+            )
+        )
+        if auto:
+            worker.defer_conflicts = True
         else:
+            # Notion 側で変わった本が手元とも食い違う場合だけ、比較画面で採用する内容を選んでもらう
+            worker.has_diff_receiver = True
+            worker.request_diff_resolution.connect(
+                lambda current, notion, queue_and_id: resolve_notion_diff(self, self.db, current, notion, queue_and_id)
+            )
+        worker.finished_all.connect(
+            lambda success, fail, error_msg: self._on_notion_sync_finished(worker, auto, success, fail, error_msg)
+        )
+        worker.finished.connect(worker.deleteLater)
+        self._notion_worker = worker
+        self.status_bar.show_sync_progress(0, 0, "Notion に接続しています…")
+        worker.start()
+
+    def _on_notion_sync_cancel(self):
+        if self._notion_worker is not None and self._notion_worker.isRunning():
+            self._notion_worker.requestInterruption()
+
+    def _on_notion_sync_finished(self, worker, auto, success, fail, error_msg):
+        self._notion_worker = None
+        if error_msg:
+            if auto:
+                first_line = error_msg.strip().splitlines()[0] if error_msg.strip() else ""
+                self.status_bar.show_sync_message(f"自動同調できませんでした: {first_line}", 12000)
+            else:
+                self.status_bar.hide_sync()
+                QMessageBox.warning(self, "Notion同調エラー", error_msg)
+            return
+        if worker.imported_count:
+            # 手元の内容が変わったときだけ書架を描き直す
             self.bookshelf.invalidate_all()
             self.reload_data()
-            QMessageBox.information(
-                self,
-                "Notion同調完了",
-                f"{dlg.success_count} 件のシナリオをNotion書架と同調しました。"
-                + (f"\n({dlg.fail_count} 件の同期に失敗)" if dlg.fail_count > 0 else ""),
-            )
+
+        if worker.imported_count or worker.pushed_count:
+            text = f"Notion と同調しました（取り込み {worker.imported_count} 件・送信 {worker.pushed_count} 件）"
+        else:
+            text = "Notion と同調しました（変更なし）"
+        if worker.deferred_count:
+            text += f"　食い違う {worker.deferred_count} 件は保留しました（手動の同調で確認できます）"
+        if fail:
+            text += f"　{fail} 件は失敗しました"
+        self.status_bar.show_sync_message(text, 12000 if (fail or worker.deferred_count) else 6000)
+
+    def _apply_auto_sync_settings(self, at_startup=False):
+        """設定に合わせて自動同調のタイマーを動かす（初期値は無効）"""
+        enabled, interval_min = app_settings.get_notion_auto_sync()
+        self._auto_sync_timer.stop()
+        if not enabled:
+            self._auto_sync_kickoff.stop()
+            return
+        if interval_min > 0:
+            self._auto_sync_timer.start(interval_min * 60 * 1000)
+        if at_startup:
+            # 起動直後の読み込みと重ならないよう、少し待ってから始める
+            self._auto_sync_kickoff.start(self.AUTO_SYNC_STARTUP_DELAY_MS)
 
     def _on_notion_diff_requested(self):
         """Notion書架との差異・不足分照合ダイアログを表示"""
@@ -925,6 +998,12 @@ class MainWindow(QMainWindow):
         """終了時に settings.ini へウィンドウ位置・サイズと最大化状態を確実に保存"""
         if getattr(self.bookshelf, "cover_loader", None):
             self.bookshelf.cover_loader.cancel_all()
+        self._auto_sync_timer.stop()
+        self._auto_sync_kickoff.stop()
+        # 同調中に閉じた場合は、今送っている1件が終わったところで止める
+        if self._notion_worker is not None and self._notion_worker.isRunning():
+            self._notion_worker.requestInterruption()
+            self._notion_worker.wait(15000)
         if hasattr(self, "_save_geom_timer") and self._save_geom_timer.isActive():
             self._save_geom_timer.stop()
         try:

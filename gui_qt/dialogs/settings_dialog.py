@@ -1602,11 +1602,64 @@ class SettingsDialog(QDialog):
         )
         limit_row.addWidget(reset_limit_btn)
 
-        limit_note = QLabel("※ 0に設定すると無制限に取り込みます。Notion APIの制限を考慮し初期値は10件です")
+        limit_note = QLabel("※ 1回の同調で取り込む冊数の上限です（残りは次回の同調で続きから取り込みます）。0で無制限")
         limit_note.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 11px;")
         limit_row.addWidget(limit_note)
         limit_row.addStretch()
         grid.addLayout(limit_row, 4, 1)
+
+        # 6. 自動同調（初期値は無効）
+        grid.addWidget(QLabel("自動同調:"), 5, 0)
+        auto_row = QHBoxLayout()
+        auto_enabled, auto_interval = app_settings.get_notion_auto_sync()
+        self.auto_sync_check = QCheckBox("バックグラウンドで自動的に同調する")
+        self.auto_sync_check.setChecked(auto_enabled)
+        self.auto_sync_check.setCursor(Qt.PointingHandCursor)
+        self.auto_sync_check.setStyleSheet(f"""
+            QCheckBox {{
+                color: {Theme.TEXT_WHITE};
+                font-size: 12px;
+                spacing: 8px;
+            }}
+            QCheckBox:hover {{
+                color: {Theme.BRASS_LIGHT};
+            }}
+            QCheckBox::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1px solid {Theme.BRASS_BASE};
+                border-radius: 2px;
+                background-color: #1a1511;
+            }}
+            QCheckBox::indicator:hover {{
+                border: 1px solid {Theme.BRASS_LIGHT};
+                background-color: #241c14;
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {Theme.BRASS_BASE};
+                border: 1px solid {Theme.BRASS_LIGHT};
+            }}
+        """)
+        auto_row.addWidget(self.auto_sync_check)
+
+        self.auto_sync_interval_spin = QSpinBox()
+        self.auto_sync_interval_spin.setRange(0, 1440)
+        self.auto_sync_interval_spin.setSingleStep(5)
+        self.auto_sync_interval_spin.setSpecialValueText("起動時のみ")
+        self.auto_sync_interval_spin.setPrefix("")
+        self.auto_sync_interval_spin.setSuffix(" 分ごと")
+        self.auto_sync_interval_spin.setValue(auto_interval)
+        self.auto_sync_interval_spin.setFixedWidth(130)
+        self.auto_sync_interval_spin.setStyleSheet(self.notion_limit_spin.styleSheet())
+        self.auto_sync_interval_spin.setEnabled(auto_enabled)
+        self.auto_sync_check.toggled.connect(self.auto_sync_interval_spin.setEnabled)
+        auto_row.addWidget(self.auto_sync_interval_spin)
+
+        auto_note = QLabel("※ 起動時と一定間隔で同調します。手元と Notion で内容が食い違う本は保留し、手動の同調で確認します")
+        auto_note.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 11px;")
+        auto_row.addWidget(auto_note)
+        auto_row.addStretch()
+        grid.addLayout(auto_row, 5, 1)
 
         layout.addLayout(grid)
 
@@ -2073,6 +2126,10 @@ class SettingsDialog(QDialog):
             self.notion_limit_spin.setValue(
                 int(cfg.get("notion_import_limit", app_settings.DEFAULT_NOTION_IMPORT_LIMIT))
             )
+            self.auto_sync_check.setChecked(bool(cfg.get("notion_auto_sync", app_settings.DEFAULT_NOTION_AUTO_SYNC)))
+            self.auto_sync_interval_spin.setValue(
+                int(cfg.get("notion_auto_sync_interval", app_settings.DEFAULT_NOTION_AUTO_SYNC_INTERVAL))
+            )
 
             shortcuts = cfg.get("shortcuts", {})
             for k, seq_edit in self.shortcut_inputs.items():
@@ -2098,6 +2155,8 @@ class SettingsDialog(QDialog):
             cfg["notion_database_id"] = self.db_id_edit.text().strip()
             cfg["api_request_interval"] = round(float(self.api_interval_spin.value()), 2)
             cfg["notion_import_limit"] = int(self.notion_limit_spin.value())
+            cfg["notion_auto_sync"] = self.auto_sync_check.isChecked()
+            cfg["notion_auto_sync_interval"] = int(self.auto_sync_interval_spin.value())
 
             shortcuts = {}
             for k, seq_edit in self.shortcut_inputs.items():

@@ -449,6 +449,22 @@ def save_notion_import_limit(limit: int):
     s.set("notion", "import_limit", str(val))
 
 
+DEFAULT_NOTION_AUTO_SYNC = False
+DEFAULT_NOTION_AUTO_SYNC_INTERVAL = 30  # 分（0 のときは起動時だけ）
+
+
+def get_notion_auto_sync() -> tuple[bool, int]:
+    """Notion との自動同調の設定 (有効か, 間隔の分数) を取得する（初期値: 無効・30分）"""
+    s = get_settings()
+    raw_on = s.get("notion", "auto_sync")
+    enabled = DEFAULT_NOTION_AUTO_SYNC if raw_on in (None, "") else str(raw_on).strip().lower() in ("1", "true", "yes", "on")
+    try:
+        interval = max(0, min(int(s.get("notion", "auto_sync_interval") or DEFAULT_NOTION_AUTO_SYNC_INTERVAL), 1440))
+    except (ValueError, TypeError):
+        interval = DEFAULT_NOTION_AUTO_SYNC_INTERVAL
+    return enabled, interval
+
+
 def load():
     """辞書形式で設定を読み出す（互換関数）"""
     s = get_settings()
@@ -456,6 +472,8 @@ def load():
         "notion_api_key": s.get_secret("notion", "token") or "",
         "notion_database_id": s.get("notion", "database_id") or "",
         "notion_import_limit": get_notion_import_limit(),
+        "notion_auto_sync": get_notion_auto_sync()[0],
+        "notion_auto_sync_interval": get_notion_auto_sync()[1],
         "api_request_interval": get_api_interval(),
         "shortcuts": get_all_shortcuts(),
         "domains": get_domain_mappings(),
@@ -473,6 +491,14 @@ def save(data):
         try:
             val = max(0, int(data["notion_import_limit"]))
             s.set("notion", "import_limit", str(val), save=False)
+        except (ValueError, TypeError):
+            pass
+    if "notion_auto_sync" in data:
+        s.set("notion", "auto_sync", "1" if data["notion_auto_sync"] else "0", save=False)
+    if data.get("notion_auto_sync_interval") is not None:
+        try:
+            val = max(0, min(int(data["notion_auto_sync_interval"]), 1440))
+            s.set("notion", "auto_sync_interval", str(val), save=False)
         except (ValueError, TypeError):
             pass
     if "api_request_interval" in data and data["api_request_interval"] is not None:

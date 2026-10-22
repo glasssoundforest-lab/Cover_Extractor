@@ -3,7 +3,9 @@
 Notion の公式 API（https://api.notion.com）を、Python の標準ライブラリだけで呼ぶ。
 """
 
+import gzip
 import hashlib
+import http.client
 import json
 import re
 import time
@@ -83,6 +85,7 @@ class NotionClient:
                 request_interval = REQUEST_INTERVAL
         self.request_interval = max(0.0, float(request_interval))
         self._last = 0.0
+        self._conns = {}
 
     def _wait(self):
         delay = self.request_interval - (time.monotonic() - self._last)
@@ -96,42 +99,86 @@ class NotionClient:
             h["Content-Type"] = content_type
         return h
 
+    def _connection(self, scheme, host):
+        """ホストごとの接続を使い回す（毎回の TCP・TLS の接続確立を省く）"""
+        key = (scheme, host)
+        conn = self._conns.get(key)
+        if conn is None:
+            cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+            conn = cls(host, timeout=60)
+            self._conns[key] = conn
+        return conn
+
+    def _drop_connection(self, scheme, host):
+        conn = self._conns.pop((scheme, host), None)
+        if conn is not None:
+            conn.close()
+
+    def close(self):
+        """使い回している接続を閉じる"""
+        for key in list(self._conns):
+            self._drop_connection(*key)
+
+    def _send(self, method, url, data, headers):
+        """1回分の送受信。(状態コード, 応答ヘッダー, 本文) を返す。本文は gzip 圧縮なら展開する"""
+        parts = urllib.parse.urlsplit(url)
+        target = parts.path or "/"
+        if parts.query:
+            target += "?" + parts.query
+        conn = self._connection(parts.scheme, parts.netloc)
+        try:
+            conn.request(method, target, body=data, headers=headers)
+            resp = conn.getresponse()
+            payload = resp.read()
+        except (http.client.HTTPException, OSError):
+            # 相手に閉じられた接続を使い回した場合などは、接続を作り直して呼び出し元で再試行する
+            self._drop_connection(parts.scheme, parts.netloc)
+            raise
+        if resp.getheader("Content-Encoding", "").lower() == "gzip":
+            payload = gzip.decompress(payload)
+        if resp.getheader("Connection", "").lower() == "close":
+            self._drop_connection(parts.scheme, parts.netloc)
+        return resp.status, resp.headers, payload
+
     def request(self, method, path, body=None, raw=None, content_type="application/json", retries=4):
         url = path if path.startswith("http") else f"{self.api_base}{path}"
         data = raw if raw is not None else (json.dumps(body).encode("utf-8") if body is not None else None)
+        headers = self._headers(content_type)
+        headers["Accept-Encoding"] = "gzip"
         for attempt in range(retries + 1):
             self._wait()
-            req = urllib.request.Request(url, data=data, method=method, headers=self._headers(content_type))
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    text = resp.read().decode("utf-8")
-                    return json.loads(text) if text else {}
-            except urllib.error.HTTPError as e:
-                detail = e.read().decode("utf-8", "replace")
-                if e.code in (429, 502, 503, 504) and attempt < retries:
-                    retry_hdr = e.headers.get("Retry-After")
-                    wait = None
-                    if retry_hdr:
-                        try:
-                            wait = float(retry_hdr)
-                        except (ValueError, TypeError):
-                            pass
-                    if wait is None:
-                        try:
-                            body_info = json.loads(detail)
-                            wait = float(body_info.get("retry_after") or body_info.get("additional_data", {}).get("retry_after") or 0)
-                        except Exception:
-                            pass
-                    if not wait or wait <= 0:
-                        wait = 1.0 * (attempt + 1)
-                    time.sleep(min(wait, 60))
-                    continue
-                raise NotionError(self._describe(e.code, detail)) from None
-            except urllib.error.URLError as e:
+                status, resp_headers, payload = self._send(method, url, data, headers)
+            except (http.client.HTTPException, OSError) as e:
                 if attempt < retries:
-                    time.sleep(1.5 * (attempt + 1))
+                    # 使い回していた接続が切れていただけのことが多いため、初回はすぐ再試行する
+                    if attempt:
+                        time.sleep(1.5 * attempt)
                     continue
-                raise NotionError(f"Notion に接続できませんでした: {e.reason}") from None
+                raise NotionError(f"Notion に接続できませんでした: {e}") from None
+            if status < 400:
+                text = payload.decode("utf-8")
+                return json.loads(text) if text else {}
+            detail = payload.decode("utf-8", "replace")
+            if status in (429, 502, 503, 504) and attempt < retries:
+                retry_hdr = resp_headers.get("Retry-After")
+                wait = None
+                if retry_hdr:
+                    try:
+                        wait = float(retry_hdr)
+                    except (ValueError, TypeError):
+                        pass
+                if wait is None:
+                    try:
+                        body_info = json.loads(detail)
+                        wait = float(body_info.get("retry_after") or body_info.get("additional_data", {}).get("retry_after") or 0)
+                    except Exception:
+                        pass
+                if not wait or wait <= 0:
+                    wait = 1.0 * (attempt + 1)
+                time.sleep(min(wait, 60))
+                continue
+            raise NotionError(self._describe(status, detail))
         raise NotionError("Notion の応答がありませんでした。")
 
     @staticmethod
@@ -167,7 +214,8 @@ class NotionClient:
             ds = self.request("GET", f"/v1/databases/{data_source_id}")
         return {name: prop.get("type") for name, prop in (ds.get("properties") or {}).items()}
 
-    def query_all(self, data_source_id, progress=None, limit=None):
+    def query_all(self, data_source_id, progress=None, limit=None, filter=None, sorts=None):
+        """ページを全件（または limit 件）取得する。filter / sorts は Notion の query の指定をそのまま渡す"""
         pages, cursor = [], None
         use_data_sources_endpoint = True
         while True:
@@ -179,6 +227,10 @@ class NotionClient:
                 page_size = max(1, min(100, remaining))
 
             body = {"page_size": page_size}
+            if filter:
+                body["filter"] = filter
+            if sorts:
+                body["sorts"] = sorts
             if cursor:
                 body["start_cursor"] = cursor
 
@@ -239,7 +291,7 @@ class NotionClient:
         return created["id"]
 
     def download(self, url, limit=32 * 1024 * 1024):
-        self._wait()
+        # 表紙画像は Notion API ではなくファイル置き場（署名付き URL）から取るため、API の間隔待ちは不要
         req = urllib.request.Request(url, headers={"User-Agent": "cover-extractor"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = resp.read(limit + 1)
@@ -521,6 +573,26 @@ def build_properties(values, mapping, schema, cover_upload_id=None):
             props[cover_col] = to_property("files", cover_upload_id)
 
     return props
+
+
+def edited_since_filter(watermark, margin_minutes=1):
+    """「watermark 以降に更新されたページ」を取り出す query の filter（Notion の更新日時は分単位のため少し余裕を持たせる）"""
+    from datetime import datetime, timedelta
+
+    since = datetime.fromisoformat(watermark.replace("Z", "+00:00")) - timedelta(minutes=margin_minutes)
+    return {
+        "timestamp": "last_edited_time",
+        "last_edited_time": {"on_or_after": since.strftime("%Y-%m-%dT%H:%M:%S.000Z")},
+    }
+
+
+OLDEST_EDIT_FIRST = [{"timestamp": "last_edited_time", "direction": "ascending"}]
+
+
+def properties_hash(props):
+    """Notion へ送る properties の要約（前回送った内容から変わったかの判定用）"""
+    text = json.dumps(props, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def export_to_notion(db, client, data_source_id, mapping=None, schema=None, target_items=None, progress_callback=None):

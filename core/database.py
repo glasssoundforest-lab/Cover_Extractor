@@ -333,7 +333,7 @@ class Database:
                 );
             """)
             for col in ["overview", "synopsis", "source_url", "title_kana", "last_opened_at", "notion_page_id", "notion_cover_hash",
-                        "author", "play_status", "notion_last_edited_time", "notion_url"]:
+                        "author", "play_status", "notion_last_edited_time", "notion_url", "notion_sync_hash"]:
                 try:
                     self.conn.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT;")
                 except sqlite3.OperationalError:
@@ -416,6 +416,8 @@ class Database:
             """)
 
             init_cover_cache(self.conn)
+            # 同調などの進み具合（例: Notion からどの更新日時まで読み込んだか）
+            self.conn.execute("CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT);")
 
     def save_item(self, file_path, title, system_name, players_text, duration_text, overview, synopsis, thumbnail_bytes):
         file_path = clean_text(file_path, max_len=1000)
@@ -548,7 +550,7 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT id, file_path, title, title_kana, author, system_name, players_text, duration_text, overview, synopsis,
-                   source_url, thumbnail, notion_page_id, notion_cover_hash, notion_last_edited_time
+                   source_url, thumbnail, notion_page_id, notion_cover_hash, notion_last_edited_time, notion_sync_hash
             FROM items ORDER BY id;
         """)
         cols = [d[0] for d in cursor.description]
@@ -556,6 +558,25 @@ class Database:
         for r in rows:
             r["tags"] = [t[1] for t in self.get_item_tags(r["id"])]
         return rows
+
+    def get_sync_state(self, key):
+        row = self.conn.execute("SELECT value FROM sync_state WHERE key = ?;", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_sync_state(self, key, value):
+        with self.conn:
+            if value is None:
+                self.conn.execute("DELETE FROM sync_state WHERE key = ?;", (key,))
+            else:
+                self.conn.execute("INSERT OR REPLACE INTO sync_state (key, value) VALUES (?, ?);", (key, value))
+
+    def set_notion_sync_state(self, item_id, sync_hash, last_edited_time=None):
+        """Notion へ最後に送った（または Notion と一致を確認した）内容のハッシュと、Notion 側の更新日時を記録する"""
+        with self.conn:
+            self.conn.execute(
+                "UPDATE items SET notion_sync_hash = ?, notion_last_edited_time = COALESCE(?, notion_last_edited_time) WHERE id = ?;",
+                (sync_hash, last_edited_time, item_id),
+            )
 
     def set_notion_link(self, item_id, page_id, cover_hash=None, notion_url=None):
         with self.conn:
