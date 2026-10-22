@@ -20,7 +20,26 @@ import sys
 import urllib.parse
 import re
 
-SETTINGS_FILE = "settings.ini"
+
+def _default_settings_file():
+    """設定ファイルの場所。アプリのフォルダの settings.ini（どこから起動しても同じ場所）。
+
+    テストは実際の設定（ウィンドウの大きさ・Notion の設定など）を書き換えないよう、一時フォルダの別ファイルを使う。
+    """
+    override = os.environ.get("GRIMOIRE_SETTINGS_FILE")
+    if override:
+        return override
+    script_dir = os.path.basename(os.path.dirname(os.path.abspath(sys.argv[0] or ""))) if sys.argv else ""
+    if script_dir == "tests":  # python tests/test_xxx.py のように直接実行された場合
+        import tempfile
+
+        return os.path.join(tempfile.gettempdir(), f"grimoire_test_settings_{os.getpid()}.ini")
+    from core.paths import app_dir
+
+    return os.path.join(app_dir(), "settings.ini")
+
+
+SETTINGS_FILE = _default_settings_file()
 _APP_SALT = "cover_extractor/notion-token/v1"
 
 _HEADER = (

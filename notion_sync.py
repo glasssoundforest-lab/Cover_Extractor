@@ -15,6 +15,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from core import error_log
+
 API_BASE = "https://api.notion.com"
 NOTION_VERSION = "2025-09-03"
 # Notion APIレート制限（無料枠：平均3回/秒・180回/分）に合わせた安全初期ディレイ（0.5秒）
@@ -36,6 +38,27 @@ FIELDS = [
     ("file_path", "ファイルの場所", ("rich_text", "url"), ("ファイル", "パス", "場所", "path", "file")),
 ]
 FIELD_LABELS = {k: label for k, label, _, _ in FIELDS}
+
+# 通過記録（セッション履歴）として取り込む列。Notion から読み込むだけで、Notion へは書き出さない。
+# (キー, 表示名, 列の種類, 列名に含まれる語, 含まれていたら選ばない語)
+_PARTY_WORDS = ("同卓", "卓メンバー", "メンバー", "参加者", "party", "member")
+PLAY_LOG_FIELDS = [
+    ("session_date", "通過日", ("date", "rich_text"),
+     ("通過日", "プレイ日", "セッション日", "実施日", "卓日", "played", "日付", "date"), ()),
+    ("party_members", "同卓者", ("rich_text", "multi_select", "people", "select"),
+     ("同卓者", "同卓", "卓メンバー", "メンバー", "参加者", "party", "members"), ()),
+    ("gm", "GM", ("rich_text", "select", "multi_select", "people"),
+     ("gm", "kp", "ゲームマスター", "キーパー"), _PARTY_WORDS),
+    ("character_name", "PC名", ("rich_text", "select", "multi_select"),
+     ("pc名", "探索者", "キャラクター名", "キャラ名", "使用キャラ", "pc", "character"), _PARTY_WORDS),
+    ("result", "結果", ("rich_text", "select", "status", "multi_select"),
+     ("結果", "結末", "エンド", "生還", "result", "ending"), ()),
+    ("sheet_url", "キャラシート", ("url", "rich_text"),
+     ("いあきゃら", "キャラシ", "キャラクターシート", "シート", "iachara", "sheet"), ()),
+    ("memo", "感想", ("rich_text",),
+     ("感想", "プレイメモ", "セッションメモ", "通過メモ"), ()),
+]
+PLAY_LOG_LABELS = {k: label for k, label, _, _, _ in PLAY_LOG_FIELDS}
 
 
 def compute_cover_hash(data: bytes | None) -> str | None:
@@ -279,6 +302,10 @@ class NotionClient:
             body["cover"] = {"type": "file_upload", "file_upload": {"id": cover_upload_id}}
         return self.request("PATCH", f"/v1/pages/{page_id}", body) if body else {}
 
+    def trash_page(self, page_id):
+        """ページを Notion のゴミ箱へ移す（Notion 上で 30 日間は元に戻せる）"""
+        return self.request("PATCH", f"/v1/pages/{page_id}", {"in_trash": True})
+
     def upload_file(self, data, filename="cover.jpg", content_type="image/jpeg"):
         created = self.request("POST", "/v1/file_uploads", {"filename": filename, "content_type": content_type})
         boundary = uuid.uuid4().hex
@@ -312,6 +339,24 @@ def guess_mapping(schema):
             pick = next((n for n in candidates if schema[n] == "title"), None)
         else:
             pick = next((n for w in words for n in candidates if norm(w) in norm(n)), None)
+        if pick:
+            mapping[key] = pick
+            used.add(pick)
+    return mapping
+
+
+def guess_play_log_mapping(schema, exclude=()):
+    """通過日・GM・PC名・同卓者などの列を列名から見つける（シナリオ情報の列に使っている列は除く）"""
+    mapping, used = {}, set(c for c in exclude if c)
+    norm = lambda s: unicodedata.normalize("NFKC", s or "").lower().replace(" ", "")
+    for key, _label, types, words, avoid in PLAY_LOG_FIELDS:
+        candidates = [
+            n for n, t in (schema or {}).items()
+            if t in types and n not in used and not any(norm(a) in norm(n) for a in avoid)
+        ]
+        # 列の種類が一番目のもの（通過日なら日付の列）を優先する
+        candidates.sort(key=lambda n: types.index(schema[n]))
+        pick = next((n for w in words for n in candidates if norm(w) in norm(n)), None)
         if pick:
             mapping[key] = pick
             used.add(pick)
@@ -425,6 +470,14 @@ def from_property(prop):
         return str(int(v)) if float(v).is_integer() else str(v)
     if t in ("url", "email", "phone_number"):
         return v or None
+    if t == "date":
+        # 日付だけを使う（時刻付きでも 2024-05-03 の形にする）。期間なら「開始〜終了」
+        if not v or not v.get("start"):
+            return None
+        start, end = v["start"][:10], (v.get("end") or "")[:10]
+        return f"{start}〜{end}" if end and end != start else start
+    if t == "people":
+        return [p.get("name") for p in v or [] if p.get("name")]
     return None
 
 
@@ -511,7 +564,85 @@ def page_values(page, mapping, schema):
         if collected:
             out["tags"] = collected
 
+    # システムが書かれていない（またはシステムの列が無い）ページは、タグ（CoC・マダミス等）からシステムを決める
+    if not (out.get("system_name") or "").strip() and out.get("tags"):
+        from core.web_extractor import WebScenarioExtractor
+
+        system = WebScenarioExtractor.guess_system_from_tags(out["tags"])
+        if system:
+            out["system_name"] = system
+            # タグから推し量った値は、手元でシステムが空のときだけ使う（手元で決めたシステムは変えない）
+            out["system_from_tags"] = True
+
+    # 人数が書かれていないページは、概要の文章や人数のタグから人数を決める
+    if not (out.get("players_text") or "").strip():
+        from core.web_extractor import WebScenarioExtractor
+
+        players = WebScenarioExtractor.guess_players(out.get("overview") or "", out.get("tags"), out.get("synopsis") or "")
+        if players:
+            out["players_text"] = players
+            # 推し量った値は、手元で人数が空のときだけ使う（手元で決めた人数は変えない）
+            out["players_inferred"] = True
+
+    # 時間が書かれていないページは、概要の文章から所要時間を決める
+    if not (out.get("duration_text") or "").strip():
+        from core.web_extractor import WebScenarioExtractor
+
+        duration = WebScenarioExtractor.guess_duration(out.get("overview") or "", out.get("synopsis") or "")
+        if duration:
+            out["duration_text"] = duration
+            out["duration_inferred"] = True
+
+    play_log_mapping = guess_play_log_mapping(schema, exclude=mapping.values())
+    if play_log_mapping:
+        out["play_log"] = page_play_log(page, play_log_mapping)
+
     return out
+
+
+def is_deleted_page_error(error):
+    """Notion のページが削除（ゴミ箱へ移動・アーカイブ）されていて書き込めない、というエラーか"""
+    text = str(error or "").lower()
+    return "archived" in text or "in trash" in text or "in_trash" in text or "trashed" in text
+
+
+def keep_local_duration(values, local_duration):
+    """概要から推し量った所要時間は、手元に時間が入っていれば使わず、手元の値のままにする"""
+    if values.get("duration_inferred") and (local_duration or "").strip():
+        values["duration_text"] = local_duration.strip()
+    return values
+
+
+def keep_local_players(values, local_players):
+    """概要やタグから推し量った人数は、手元に人数が入っていれば使わず、手元の値のままにする"""
+    if values.get("players_inferred") and (local_players or "").strip():
+        values["players_text"] = local_players.strip()
+    return values
+
+
+def keep_local_system(values, local_system):
+    """タグから推し量ったシステムは、手元にシステムが入っていれば使わず、手元の値のままにする
+    （食い違いとして比較画面に出したり、手元の値を書き換えたりしないため）"""
+    if values.get("system_from_tags") and (local_system or "").strip():
+        values["system_name"] = local_system.strip()
+    return values
+
+
+def page_play_log(page, play_log_mapping):
+    """ページの通過記録（通過日・GM・PC名・同卓者など）をセッション履歴 1 件分の辞書にする。何も書かれていなければ None"""
+    props = page.get("properties") or {}
+    log = {}
+    for key, col in play_log_mapping.items():
+        value = from_property(props.get(col))
+        if isinstance(value, list):
+            value = "、".join(v for v in value if v)
+        value = (value or "").strip()
+        if key != "memo":
+            # 1 行の欄なので、改行で並べた同卓者などは「、」でつなぐ
+            value = "、".join(line.strip() for line in value.splitlines() if line.strip())
+        if value:
+            log[key] = value
+    return log or None
 
 
 def import_from_notion(db, client, data_source_id, mapping=None, schema=None, progress_callback=None, limit=10):
@@ -548,7 +679,8 @@ def import_from_notion(db, client, data_source_id, mapping=None, schema=None, pr
             try:
                 thumb_bytes = client.download(cover_url)
             except Exception as e:
-                print(f"[NotionSync] Cover download failed for {title}: {e}")
+                error_log.log_error(f"Notion の表紙画像を取得する（『{title}』）",
+                                    "表紙画像を取得できませんでした（表紙なしで続けます）", exc=e)
 
         item_id = db.save_or_update_from_notion(
             page_id, vals, thumbnail_bytes=thumb_bytes, last_edited_time=notion_edit_time
@@ -630,7 +762,8 @@ def export_to_notion(db, client, data_source_id, mapping=None, schema=None, targ
             try:
                 cover_upload_id = client.upload_file(thumb_bytes, filename="cover.jpg", content_type="image/jpeg")
             except Exception as ce:
-                print(f"[NotionSync] Cover upload failed for {title}: {ce}")
+                error_log.log_error(f"表紙画像を Notion へ送る（『{title}』）",
+                                    "表紙画像を送れませんでした（表紙なしで続けます）", exc=ce)
 
         props = build_properties(export_it, mapping, schema, cover_upload_id=cover_upload_id)
 
@@ -849,7 +982,8 @@ def export_single_item_to_notion(db, client, data_source_id, item_id, mapping=No
         try:
             cover_upload_id = client.upload_file(thumb_bytes, filename="cover.jpg", content_type="image/jpeg")
         except Exception as ce:
-            print(f"[NotionSync] Single item cover upload failed for {title}: {ce}")
+            error_log.log_error(f"表紙画像を Notion へ送る（『{title}』）",
+                                "表紙画像を送れませんでした（表紙なしで続けます）", exc=ce)
 
     props = build_properties(export_it, mapping, schema, cover_upload_id=cover_upload_id)
 
@@ -899,7 +1033,8 @@ def import_single_page_from_notion(db, client, page_or_vals, mapping=None, schem
         try:
             thumb_bytes = client.download(cover_url)
         except Exception as e:
-            print(f"[NotionSync] Single cover download error: {e}")
+            error_log.log_error("Notion の表紙画像を取得する",
+                                "表紙画像を取得できませんでした（表紙なしで続けます）", exc=e)
 
     last_edited = page.get("last_edited_time") or vals.get("last_edited_time") or ""
     return db.save_or_update_from_notion(page_id, vals, thumbnail_bytes=thumb_bytes, last_edited_time=last_edited)

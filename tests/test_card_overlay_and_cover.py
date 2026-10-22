@@ -100,8 +100,9 @@ class TestCardOverlayAndCover(unittest.TestCase):
         self.assertEqual(card.thumb_overlay.parent(), card.thumb_container)
 
         self.assertIn("狂気山脈", card.title_label.text())
-        self.assertIn("クトゥルフ神話TRPG", card.meta_label.text())
-        self.assertIn("3〜4人", card.meta_label.text())
+        # システム・人数はピルアイコン、時間は文字
+        self.assertEqual(card.system_pill.text(), "CoC")
+        self.assertEqual(card.players_pill.text(), "3〜4人")
         self.assertIn("4〜6時間", card.meta_label.text())
 
         # オーバーレイ帯が表紙の下部に配置されていること

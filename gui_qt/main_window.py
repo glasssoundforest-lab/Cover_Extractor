@@ -8,7 +8,7 @@
 import os
 import sys
 import threading
-from PySide6.QtCore import Qt, QSettings, QRect, QEvent, QTimer, Signal
+from PySide6.QtCore import Qt, QObject, QSettings, QRect, QEvent, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -23,13 +23,12 @@ from PySide6.QtWidgets import (
 import app_settings
 from core import (
     Database,
-    RustDllExtractor,
-    collect_scenario_targets,
-    extract_scenario_data,
     sort_items,
     global_tag_sort_key,
 )
 from .theme import Theme
+from .error_dialog import show_error
+from core import error_log
 from .components import (
     OrnateFrame,
     OrnateDivider,
@@ -59,6 +58,33 @@ UNSET_TAG_KEYWORDS = {
 }
 
 
+class _ExtractorRelay(QObject):
+    """Rust エンジンの読み込み結果を、読み込み用のスレッドから画面スレッドへ渡す中継役"""
+
+    loaded = Signal(object, bool)  # (RustDllExtractor または None, 読み込めたか)
+
+    def __init__(self):
+        super().__init__()
+        self.result = None
+
+
+def _load_rust_extractor(relay):
+    """（別スレッド）Rust DLL を読み込み、結果を relay で知らせる"""
+    try:
+        from core.extractor import RustDllExtractor  # 読み込みに時間がかかるので、画面を作るのと並行してここで読む
+
+        ex = RustDllExtractor()
+    except Exception as e:  # noqa: BLE001
+        error_log.log_error("Rust エンジン（cover_extractor.dll）を読み込む",
+                            "表紙・情報の抽出エンジンを読み込めませんでした（簡易抽出で動作します）", exc=e)
+        ex = None
+    relay.result = ex
+    try:
+        relay.loaded.emit(ex, ex is not None)
+    except RuntimeError:
+        pass  # アプリの終了と重なった
+
+
 class MainWindow(QMainWindow):
     """西洋古書・グリモワール調メインウィンドウ"""
     extractor_loaded = Signal(object, bool)  # (RustDllExtractor または None, 読み込めたか)
@@ -76,6 +102,7 @@ class MainWindow(QMainWindow):
         # バックエンド初期化
         self.db = Database(db_path)
         self._notion_worker = None  # バックグラウンドで動いている Notion との同調
+        self._auto_sync_error_reported = False  # 自動同調の失敗をポップアップで知らせ済みか
         self._auto_sync_timer = QTimer(self)
         self._auto_sync_timer.timeout.connect(lambda: self._start_notion_sync(auto=True))
         self._auto_sync_kickoff = QTimer(self)  # 起動直後の1回目
@@ -86,7 +113,13 @@ class MainWindow(QMainWindow):
         self._extractor = None
         self.rust_ok = None
         self.extractor_loaded.connect(self._on_extractor_loaded)
-        self._extractor_thread = threading.Thread(target=self._load_extractor, name="rust-extractor-loader", daemon=True)
+        # 読み込み用のスレッドはこの画面には触れず、中継役（_ExtractorRelay）を通して結果を画面スレッドへ渡す。
+        # 読み込み中に画面が閉じられて破棄されても、破棄された画面へ知らせて落ちることがないように
+        self._extractor_relay = _ExtractorRelay()
+        self._extractor_relay.loaded.connect(self.extractor_loaded)
+        self._extractor_thread = threading.Thread(
+            target=_load_rust_extractor, args=(self._extractor_relay,), name="rust-extractor-loader", daemon=True
+        )
         self._extractor_thread.start()
 
         # 一覧表示用のタグ情報（reload_data で読み込み、絞り込みのたびには DB を読まない）
@@ -173,8 +206,15 @@ class MainWindow(QMainWindow):
         # 右側メイン書架（枠右上に並び順コンボボックスを配置）
         self.bookshelf = BookshelfGrid(self, db=self.db)
         self.bookshelf.card_clicked.connect(self._on_card_clicked)
-        self.bookshelf.card_double_clicked.connect(self._on_card_double_clicked)
-        self.bookshelf.card_context_menu_requested.connect(self._on_card_context_menu)
+        # 詳細画面・右クリックメニューは、カードのマウス操作の処理を抜けてから開く。
+        # 開いている間の編集で書架が描き直されるとカードが作り直されるため、
+        # カードの処理の途中で開くと、閉じたときに消えたカードへ処理が戻ってしまう
+        self.bookshelf.card_double_clicked.connect(
+            lambda item_id: QTimer.singleShot(0, lambda: self._on_card_double_clicked(item_id))
+        )
+        self.bookshelf.card_context_menu_requested.connect(
+            lambda item_id, pos: QTimer.singleShot(0, lambda: self._on_card_context_menu(item_id, pos))
+        )
         self.bookshelf.sort_changed.connect(self._on_sort_changed)
         self.bookshelf.selection_cleared.connect(self._on_selection_cleared)
         content_layout.addWidget(self.bookshelf)
@@ -195,16 +235,6 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     # Rust エンジンの読み込み
     # -------------------------------------------------------------------------
-    def _load_extractor(self):
-        """（別スレッド）Rust DLL を読み込む。完了を extractor_loaded で画面スレッドへ知らせる"""
-        try:
-            ex = RustDllExtractor()
-        except Exception as e:  # noqa: BLE001
-            print(f"[MainWindow] Rust engine unavailable: {e}")
-            ex = None
-        self._extractor = ex
-        self.extractor_loaded.emit(ex, ex is not None)
-
     def _on_extractor_loaded(self, ex, ok):
         self._extractor = ex
         self.rust_ok = ok
@@ -221,6 +251,8 @@ class MainWindow(QMainWindow):
             finally:
                 QApplication.restoreOverrideCursor()
         if self.rust_ok is None:
+            # 読み込みは終わったが、知らせ（画面スレッドでの反映）がまだ届いていない
+            self._extractor = self._extractor_relay.result
             self.rust_ok = self._extractor is not None
         return self._extractor
 
@@ -562,13 +594,14 @@ class MainWindow(QMainWindow):
 
     def _on_notion_sync_finished(self, worker, auto, success, fail, error_msg):
         self._notion_worker = None
+        operation = "Notion と自動同調する" if auto else "Notion と同調する"
         if error_msg:
+            first_line = error_msg.strip().splitlines()[0] if error_msg.strip() else ""
             if auto:
-                first_line = error_msg.strip().splitlines()[0] if error_msg.strip() else ""
                 self.status_bar.show_sync_message(f"自動同調できませんでした: {first_line}", 12000)
             else:
                 self.status_bar.hide_sync()
-                QMessageBox.warning(self, "Notion同調エラー", error_msg)
+            self._report_sync_error(auto, operation, error_msg.strip(), worker.error_detail, "Notion同調エラー")
             return
         if worker.imported_count:
             # 手元の内容が変わったときだけ書架を描き直す
@@ -583,7 +616,35 @@ class MainWindow(QMainWindow):
             text += f"　食い違う {worker.deferred_count} 件は保留しました（手動の同調で確認できます）"
         if fail:
             text += f"　{fail} 件は失敗しました"
-        self.status_bar.show_sync_message(text, 12000 if (fail or worker.deferred_count) else 6000)
+        if worker.unlinked_titles:
+            text += f"　Notion で削除されていた {len(worker.unlinked_titles)} 冊は連携を外しました"
+        self.status_bar.show_sync_message(
+            text, 12000 if (fail or worker.deferred_count or worker.unlinked_titles) else 6000
+        )
+        if worker.unlinked_titles and not auto:
+            from .dialogs.notion_sync_dialog import unlinked_message
+
+            QMessageBox.information(self, "Notion で削除されていた本", unlinked_message(worker.unlinked_titles))
+        if worker.errors:
+            self._report_sync_error(
+                auto, operation, f"{len(worker.errors)} 冊の同調に失敗しました",
+                "\n\n".join(worker.errors), "Notion同調エラー",
+            )
+        else:
+            self._auto_sync_error_reported = False
+
+    def _report_sync_error(self, auto, operation, message, detail, title):
+        """同調のエラーを error.log に書き出し、詳細をポップアップで表示する。
+
+        自動同調では、つながらない状態が続いても一定間隔ごとにポップアップが出続けないよう、
+        失敗が続く間は最初の 1 回だけ表示する（ログには毎回書き出す）。
+        """
+        if auto and self._auto_sync_error_reported:
+            error_log.log_error(operation, message, detail=detail)
+            return
+        if auto:
+            self._auto_sync_error_reported = True
+        show_error(self, operation, message, detail=detail, title=title)
 
     def _apply_auto_sync_settings(self, at_startup=False):
         """設定に合わせて自動同調のタイマーを動かす（初期値は無効）"""
@@ -623,7 +684,14 @@ class MainWindow(QMainWindow):
         # 詳細画面は Rust エンジンを使わないため、読み込み完了を待たずに渡す
         dlg = ItemDetailDialog(item_id, self.db, self._extractor, item_ids=current_ids, parent=self)
         dlg.item_updated.connect(self._on_item_updated)
+        dlg.item_deleted.connect(self._on_item_discarded)
         dlg.exec()
+
+    def _on_item_discarded(self, item_id):
+        """詳細画面で破棄されたシナリオを書架から外す"""
+        if self.selected_item and self.selected_item[0] == item_id:
+            self.selected_item = None
+        self.reload_data()
 
     def _on_item_updated(self, item_id):
         """詳細画面での編集（表紙の差し替えを含む）を書架へ反映する"""
@@ -719,6 +787,8 @@ class MainWindow(QMainWindow):
 
     def _import_targets(self, paths):
         """ターゲットの解析とデータベースへの一括保存（非同期プログレスダイアログ）"""
+        from core.extractor import collect_scenario_targets
+
         targets = collect_scenario_targets(paths)
         if not targets:
             QMessageBox.information(self, "案内", "取り込み可能なシナリオ（PDF, ZIP, フォルダ）が見つかりませんでした。")
@@ -737,8 +807,11 @@ class MainWindow(QMainWindow):
             if dlg.fail_count > 0:
                 msg += f"\n({dlg.fail_count} 件の取り込みに失敗)"
             QMessageBox.information(self, "取り込み完了", msg)
-        elif dlg.fail_count > 0:
-            QMessageBox.warning(self, "取り込み失敗", f"{dlg.fail_count} 件の取り込みに失敗しました。")
+        if dlg.fail_count > 0:
+            show_error(
+                self, "シナリオファイルを書架に取り込む", f"{dlg.fail_count} 件の取り込みに失敗しました",
+                detail="\n\n".join(dlg.errors), title="取り込み失敗",
+            )
 
     def _init_window_geometry(self):
         """settings.ini からウィンドウ位置・サイズ・最大化状態を読み出して適用"""

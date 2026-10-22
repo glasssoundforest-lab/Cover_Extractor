@@ -47,8 +47,10 @@ def _library_name():
 
 
 def _app_dir():
-    # core/ の親ディレクトリ（アプリケーションルート）
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # アプリケーションルート（実行ファイルにした場合は exe のあるフォルダ）
+    from core.paths import app_dir
+
+    return app_dir()
 
 
 def _library_candidates():

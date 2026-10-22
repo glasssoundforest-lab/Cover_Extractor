@@ -20,7 +20,96 @@ from ..theme import Theme
 from ..components.ornate import OrnateFrame, OrnateDivider, make_fleur_pixmap
 import app_settings
 import notion_sync
+from core import error_log
+from ..error_dialog import show_error
 from app_settings import Settings
+
+
+def unlinked_message(titles):
+    """Notion 側で削除されていたため連携を外した本の知らせ"""
+    shown = "\n".join(f"・『{t}』" for t in titles[:20])
+    if len(titles) > 20:
+        shown += f"\n…ほか {len(titles) - 20} 冊"
+    return (
+        f"次の {len(titles)} 冊は、Notion 側でページが削除（ゴミ箱へ移動）されていたため、Notion との連携を外しました。\n"
+        f"{shown}\n\n"
+        "手元の書架からは消していません。Notion へ新しく作り直すこともしません。\n"
+        "・Notion でページを元に戻すと、次の同調でまた連携します。\n"
+        "・手元の書架からも消す場合は、書架の右クリックメニューから除籍してください。\n"
+        "・Notion に登録し直す場合は、Notion 差分確認の「手元のみ」から登録してください。"
+    )
+
+
+class NotionSetupError(Exception):
+    """Notion の設定（トークン・データベース・列の対応）が足りないため接続できない"""
+
+
+def open_notion_connection():
+    """設定に従って Notion へ接続し、(client, data_source_id, schema, mapping) を返す（別スレッドから呼ぶ）。
+
+    mapping は、保存済みの列の対応に、Notion の列名から推し量った対応を補ったもの。
+    設定が足りないときは NotionSetupError を、通信の失敗はそのまま例外を投げる。
+    """
+    settings = Settings(app_settings.SETTINGS_FILE)
+    token = settings.get_secret("notion", "token") or ""
+    db_url_or_id = (
+        settings.get("notion", "database_id", "")
+        or settings.get("notion", "database_url", "")
+        or ""
+    ).strip()
+    if not token or not db_url_or_id:
+        raise NotionSetupError(
+            "NotionのAPIトークンまたはデータベースIDが設定されていません。\n右上のメニューの「設定」からNotion設定を保存してください。"
+        )
+
+    db_id = notion_sync.database_id_from_url(db_url_or_id)
+    client = notion_sync.NotionClient(token, request_interval=app_settings.get_api_interval())
+    _title, sources = client.data_sources(db_id)
+    data_source_id = sources[0][0] if sources else db_id
+    schema = client.schema(data_source_id)
+
+    # マッピングの取得（保存済み設定 + 自動推測フォールバック）
+    mapping = dict(settings.get_json("notion", "mapping", {}) or {})
+    for key, _, _, _ in notion_sync.FIELDS:
+        col = settings.get("notion_mapping", key, "")
+        if col:
+            mapping[key] = col
+    guessed = notion_sync.guess_mapping(schema)
+    for key, col in guessed.items():
+        if not mapping.get(key) or mapping.get(key) not in schema:
+            mapping[key] = col
+
+    problem = notion_sync.check_mapping(schema, mapping, require_file_path=False)
+    if problem:
+        client.close()
+        raise NotionSetupError(f"列マッピングに不備があります:\n{problem}\n設定画面をご確認ください。")
+    return client, data_source_id, schema, mapping
+
+
+def fetch_notion_page(page_id):
+    """（別スレッドで呼ぶ）Notion のページ 1 件を読み、手元の形の値と表紙画像を返す。
+
+    戻り値: {"page": ページ, "values": page_values の結果, "image_bytes": 表紙（無ければ None）}
+    """
+    client, _data_source_id, schema, mapping = open_notion_connection()
+    try:
+        page = client.request("GET", f"/v1/pages/{page_id}")
+        if not isinstance(page, dict) or page.get("object") != "page":
+            raise notion_sync.NotionError("Notion からページの情報を取得できませんでした。")
+        if page.get("in_trash") or page.get("archived"):
+            raise notion_sync.NotionError("このページは Notion 側で削除（ゴミ箱へ移動）されています。")
+        values = notion_sync.page_values(page, mapping, schema)
+        image_bytes = None
+        cover_url = notion_sync.page_cover_url(page)
+        if cover_url:
+            try:
+                image_bytes = client.download(cover_url)
+            except Exception as e:
+                error_log.log_error(f"Notion の表紙画像を取得する（『{values.get('title') or page_id}』）",
+                                    "表紙画像を取得できませんでした（表紙なしで続けます）", exc=e)
+        return {"page": page, "values": values, "image_bytes": image_bytes}
+    finally:
+        client.close()
 
 
 class NotionSyncWorker(QThread):
@@ -38,65 +127,46 @@ class NotionSyncWorker(QThread):
         self.imported_count = 0  # Notion から取り込んだ（手元を更新した）冊数
         self.pushed_count = 0    # Notion へ送った冊数
         self.deferred_count = 0  # 食い違いのため保留した冊数
+        # 失敗した本ごとのエラー（error.log と同じ形式の文章）。表示とログへの書き出しは画面側で行う
+        self.errors = []
+        self.error_detail = ""   # 接続できなかったときなどの詳細（どこで起きたか）
+        # Notion 側でページが削除されていたため、連携を外した本の題名
+        self.unlinked_titles = []
 
     def run(self):
         from core.database import Database
         worker_db = Database(self.db_path)
 
-        settings = Settings(app_settings.SETTINGS_FILE)
-        token = settings.get_secret("notion", "token") or ""
-        db_url_or_id = (
-            settings.get("notion", "database_id", "")
-            or settings.get("notion", "database_url", "")
-            or ""
-        ).strip()
-
-        if not token or not db_url_or_id:
-            self.finished_all.emit(
-                0,
-                0,
-                "NotionのAPIトークンまたはデータベースIDが設定されていません。\n右上のメニューの「設定」からNotion設定を保存してください。",
-            )
+        try:
+            client, data_source_id, schema, mapping = open_notion_connection()
+        except NotionSetupError as e:
+            self.finished_all.emit(0, 0, str(e))
+            return
+        except Exception as e:
+            self.error_detail = error_log.exception_detail(e)
+            self.finished_all.emit(0, 0, f"Notionへの接続に失敗しました:\n{e}")
             return
 
         try:
-            db_id = notion_sync.database_id_from_url(db_url_or_id)
-            client = notion_sync.NotionClient(
-                token, request_interval=app_settings.get_api_interval()
-            )
-            _title, sources = client.data_sources(db_id)
-            data_source_id = sources[0][0] if sources else db_id
-            schema = client.schema(data_source_id)
-
-            # マッピングの取得（保存済み設定 + 自動推測フォールバック）
-            mapping = dict(settings.get_json("notion", "mapping", {}) or {})
-            for key, _, _, _ in notion_sync.FIELDS:
-                col = settings.get("notion_mapping", key, "")
-                if col:
-                    mapping[key] = col
-
-            guessed = notion_sync.guess_mapping(schema)
-            for key, col in guessed.items():
-                if not mapping.get(key) or mapping.get(key) not in schema:
-                    mapping[key] = col
-
-            problem = notion_sync.check_mapping(schema, mapping, require_file_path=False)
-            if problem:
-                self.finished_all.emit(0, 0, f"列マッピングに不備があります:\n{problem}\n設定画面をご確認ください。")
-                return
-
             limit_val = app_settings.get_notion_import_limit()
             import_limit = None if limit_val == 0 else limit_val
 
             # 前回の同調でどの更新日時まで読み込んだか。分かっていれば、それ以降に更新されたページだけを取得する
             watermark_key = f"notion_watermark:{data_source_id}"
             watermark = worker_db.get_sync_state(watermark_key)
+            # 通過記録（通過日・GM・PC名・同卓者など）の列があるのに、まだ一度も全ページから読み込んでいなければ、
+            # 前回以降に更新されていないページの通過記録も取り込めるよう、今回だけ全ページを取得する
+            play_log_backfill_key = f"notion_play_log_backfill:{data_source_id}"
+            needs_play_log_backfill = bool(
+                notion_sync.guess_play_log_mapping(schema, exclude=mapping.values())
+            ) and not worker_db.get_sync_state(play_log_backfill_key)
             pages = client.query_all(
                 data_source_id,
-                filter=notion_sync.edited_since_filter(watermark) if watermark else None,
+                filter=notion_sync.edited_since_filter(watermark) if watermark and not needs_play_log_backfill else None,
                 sorts=notion_sync.OLDEST_EDIT_FIRST,
             )
         except Exception as e:
+            self.error_detail = error_log.exception_detail(e)
             self.finished_all.emit(0, 0, f"Notionへの接続に失敗しました:\n{e}")
             return
 
@@ -109,8 +179,12 @@ class NotionSyncWorker(QThread):
         unsettled_page_ids = {p.get("id") for p in pages if p.get("id")}
         new_watermark = None
         watermark_blocked = False
+        all_pages_visited = True
 
         # 同期前のローカル状態をスナップショット（ローカルで表紙や項目が更新された既存ページを検知するため）
+        # 手元だけで破棄した本の Notion ページは取り込み直さない
+        ignored_page_ids = worker_db.get_ignored_notion_pages()
+
         pre_local_by_pid = {
             it["notion_page_id"]: it
             for it in worker_db.items_for_notion()
@@ -121,9 +195,11 @@ class NotionSyncWorker(QThread):
         total_remote = len(pages)
         for idx, page in enumerate(pages):
             if self.isInterruptionRequested():
+                all_pages_visited = False
                 break
             # 取り込み件数の上限（実際に手元へ取り込んだ冊数で数える。残りは次回の同調で続きから取り込む）
             if import_limit is not None and self.imported_count >= import_limit:
+                all_pages_visited = False
                 break
 
             page_id = page.get("id") or f"notion-page-{idx}"
@@ -134,12 +210,25 @@ class NotionSyncWorker(QThread):
 
             settled = True  # このページを反映し終えたか（保留・失敗なら False）
             try:
+                if page_id in ignored_page_ids:
+                    unsettled_page_ids.discard(page_id)
+                    continue
                 # 既存レコードの探索（page_id一致、file_path一致、または同一タイトル）
                 existing = worker_db.find_existing_item_for_notion(
                     page_id=page_id,
                     title=title,
                     file_path=vals.get("file_path"),
                 )
+
+                if existing:
+                    notion_sync.keep_local_system(vals, existing.get("system_name"))
+                    notion_sync.keep_local_players(vals, existing.get("players_text"))
+                    notion_sync.keep_local_duration(vals, existing.get("duration_text"))
+
+                # 通過記録は Notion から読み込むだけの情報なので、本の内容が食い違って保留する場合や
+                # Notion 側が前回から変わっていない場合でも取り込む（内容が変わっていなければ何もしない）
+                if existing and "play_log" in vals:
+                    worker_db.apply_notion_play_log(existing["id"], page_id, vals["play_log"])
 
                 # 同一更新日時の場合はスキップ
                 if (
@@ -168,7 +257,8 @@ class NotionSyncWorker(QThread):
                     try:
                         thumb_bytes = client.download(cover_url)
                     except Exception as ce:
-                        print(f"[NotionSync] Cover download error for {title}: {ce}")
+                        error_log.log_error(f"Notion の表紙画像を取得する（『{title}』）",
+                                            "表紙画像を取得できませんでした（表紙なしで続けます）", exc=ce)
 
                 if pre_it:
                     # ローカルで表紙が変更されている場合、またはNotion側で空の項目がローカルにある場合はNotionへ書き戻す対象にする
@@ -301,7 +391,10 @@ class NotionSyncWorker(QThread):
                 self.imported_count += 1
                 success += 1
             except Exception as e:
-                print(f"[NotionSync] Error importing page {title}: {e}")
+                self.errors.append(error_log.build_entry(
+                    f"Notion のページを手元へ取り込む（『{title}』）", str(e) or type(e).__name__,
+                    error_log.exception_detail(e),
+                ))
                 settled = False
                 fail += 1
             finally:
@@ -313,6 +406,8 @@ class NotionSyncWorker(QThread):
 
         if new_watermark and (not watermark or new_watermark > watermark):
             worker_db.set_sync_state(watermark_key, new_watermark)
+        if needs_play_log_backfill and all_pages_visited:
+            worker_db.set_sync_state(play_log_backfill_key, "done")
 
         # 2. ローカル DB にある未同期アイテム（およびローカル変更がある既存アイテム）を Notion テーブル構造に合わせて書き出し
         #    前回 Notion へ送った内容（または Notion と一致を確認した内容）から変わっていないものは送らない
@@ -329,6 +424,8 @@ class NotionSyncWorker(QThread):
             )
             if page_id in unsettled_page_ids:
                 continue
+            if not page_id and it.get("notion_deleted_page_id"):
+                continue  # Notion 側で削除されたページの本は、Notion に作り直さない
             if not page_id or page_id in needs_push_page_ids:
                 local_targets.append((it, export_it, props_hash))
             elif page_id in fresh_page_ids:
@@ -358,7 +455,8 @@ class NotionSyncWorker(QThread):
                             thumb_bytes, filename="cover.jpg", content_type="image/jpeg"
                         )
                     except Exception as ce:
-                        print(f"[NotionSync] Cover upload error for {title}: {ce}")
+                        error_log.log_error(f"表紙画像を Notion へ送る（『{title}』）",
+                                            "表紙画像を送れませんでした（表紙なしで続けます）", exc=ce)
 
                 props = notion_sync.build_properties(
                     export_it, mapping, schema, cover_upload_id=cover_upload_id
@@ -386,7 +484,16 @@ class NotionSyncWorker(QThread):
                 # （次回の同期で、自分で書き込んだページを「Notion 側で更新された」と取り違えて読み直さないため）
                 worker_db.set_notion_sync_state(it["id"], props_hash, (updated or {}).get("last_edited_time"))
             except Exception as e:
-                print(f"[NotionSync] Error syncing item {title}: {e}")
+                page_id = it.get("notion_page_id")
+                if page_id and notion_sync.is_deleted_page_error(e):
+                    # Notion 側でページが削除されていた。手元の本は残し、そのページとの連携だけを外す
+                    worker_db.unlink_deleted_notion_page(it["id"], page_id)
+                    self.unlinked_titles.append(title)
+                    continue
+                self.errors.append(error_log.build_entry(
+                    f"手元の本を Notion へ送る（『{title}』）", str(e) or type(e).__name__,
+                    error_log.exception_detail(e),
+                ))
                 fail += 1
 
         client.close()
@@ -545,6 +652,15 @@ class NotionSyncDialog(QDialog):
         self.error_message = error_msg
         if hasattr(self, "worker") and self.worker.isRunning():
             self.worker.wait(1000)
+        worker = getattr(self, "worker", None)
+        if error_msg:
+            show_error(self, "Notion と同調する", error_msg.strip(),
+                       detail=getattr(worker, "error_detail", ""), title="Notion同調エラー")
+        elif getattr(worker, "errors", None):
+            show_error(self, "Notion と同調する", f"{len(worker.errors)} 冊の同調に失敗しました",
+                       detail="\n\n".join(worker.errors), title="Notion同調エラー")
+        if getattr(worker, "unlinked_titles", None):
+            QMessageBox.information(self, "Notion で削除されていた本", unlinked_message(worker.unlinked_titles))
         self.accept()
 
     def closeEvent(self, event):

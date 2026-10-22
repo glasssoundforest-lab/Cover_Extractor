@@ -190,8 +190,9 @@ def run_tests():
     # 4.2 タグ枠内のPillTag統一検証
     # tags_container のレイアウト内を走査して PillTag の存在を確認
     found_pill_tags = []
-    for i in range(detail_dlg.tags_flow_layout.count()):
-        item = detail_dlg.tags_flow_layout.itemAt(i)
+    for lay in (detail_dlg.global_flow_layout, detail_dlg.tags_flow_layout):
+      for i in range(lay.count()):
+        item = lay.itemAt(i)
         if item.widget() and isinstance(item.widget(), PillTag):
             found_pill_tags.append(item.widget().text)
         elif item.layout():

@@ -29,6 +29,8 @@ from ..components.ornate import OrnateFrame, OrnateDivider, make_fleur_pixmap
 from ..components.ornate_title_bar import OrnateTitleBar
 from .web_info_diff_dialog import WebInfoComparisonDialog
 from ..async_task import run_async
+from ..error_dialog import show_error
+from core import error_log
 from shiboken6 import isValid
 import app_settings
 import notion_sync
@@ -93,7 +95,7 @@ class NotionAuditWorker(QThread):
             diff_result["data_source_id"] = data_source_id
             self.finished.emit(diff_result)
         except Exception as e:
-            self.error.emit(f"照合に失敗しました:\n{e}")
+            self.error.emit(f"照合に失敗しました:\n{e}\n\n[詳細]\n{error_log.exception_detail(e)}")
 
 
 class NotionDiffDialog(QDialog):
@@ -533,7 +535,8 @@ class NotionDiffDialog(QDialog):
         self.pbar.setVisible(False)
         self.btn_recheck.setEnabled(True)
         self.status_label.setText("照合エラーが発生しました。")
-        QMessageBox.warning(self, "照合エラー", err_msg)
+        message, _, detail = err_msg.partition("\n\n[詳細]\n")
+        show_error(self, "Notion と手元の書架を照合する", message, detail=detail, title="照合エラー")
 
     def _populate_local_only_table(self, items: list[dict]):
         self.table_local_only.setRowCount(0)
@@ -690,7 +693,7 @@ class NotionDiffDialog(QDialog):
             self.table_field_lacking.setCellWidget(row, 3, btn_container)
 
 
-    def _run_notion_task(self, work, on_done, error_title, error_prefix):
+    def _run_notion_task(self, work, on_done, error_title, error_prefix, operation=None):
         """Notion との通信を別スレッドで実行する（通信中も画面は固まらない）。
 
         work(worker_db) は別スレッドで呼ばれる。worker_db はそのスレッド専用の Database。
@@ -719,7 +722,7 @@ class NotionDiffDialog(QDialog):
             callback(value)
 
         def failed(error):
-            QMessageBox.warning(self, error_title, f"{error_prefix}\n{error}")
+            show_error(self, operation or error_title, error_prefix.rstrip(":："), exc=error, title=error_title)
 
         run_async(task, lambda r: finish(on_done, r), lambda e: finish(failed, e))
 
@@ -749,6 +752,7 @@ class NotionDiffDialog(QDialog):
             done,
             "エラー",
             "Notionへの登録に失敗しました:",
+            operation="手元の本を Notion へ登録する",
         )
 
     def _import_single_page(self, page_vals: dict):
@@ -779,6 +783,7 @@ class NotionDiffDialog(QDialog):
             done,
             "エラー",
             f"『{title}』の取り込みに失敗しました:",
+            operation=f"Notion のページを手元へ取り込む（『{title}』）",
         )
 
     def _resolve_single_diff(self, diff_entry: dict):
@@ -793,7 +798,8 @@ class NotionDiffDialog(QDialog):
             try:
                 return client.download(c_url)
             except Exception as e:
-                print(f"[NotionDiffDialog] Cover download error: {e}")
+                error_log.log_error("Notion 側の表紙を取得する（差分の比較）",
+                                    "表紙画像を取得できませんでした（表紙なしで比較を続けます）", exc=e)
                 return None
 
         self._run_notion_task(
@@ -801,6 +807,7 @@ class NotionDiffDialog(QDialog):
             lambda thumb_bytes: self._open_resolve_dialog(diff_entry, thumb_bytes),
             "差分反映エラー",
             "Notion側の表紙の取得中にエラーが発生しました:",
+            operation="Notion 側の表紙を取得する（差分の比較）",
         )
 
     def _open_resolve_dialog(self, diff_entry: dict, thumb_bytes):
@@ -896,7 +903,8 @@ class NotionDiffDialog(QDialog):
 
                 QMessageBox.information(self, "反映完了", "項目の反映を完了しました。")
         except Exception as e:
-            QMessageBox.warning(self, "差分反映エラー", f"差分データの比較・反映中にエラーが発生しました:\n{e}")
+            show_error(self, "Notion との差分を比較・反映する", "差分データの比較・反映中にエラーが発生しました", exc=e,
+                       title="差分反映エラー")
 
     def _export_all_local_only(self):
         """手元のみの全アイテムをNotionへ書き出す"""
@@ -932,7 +940,8 @@ class NotionDiffDialog(QDialog):
                 QMessageBox.information(self, "完了", f"{success} / {len(targets)} 冊をNotionへ登録しました。")
                 self._start_audit()
 
-            self._run_notion_task(export_all, done, "エラー", "Notionへの登録に失敗しました:")
+            self._run_notion_task(export_all, done, "エラー", "Notionへの登録に失敗しました:",
+                                  operation="手元にしか無い本をまとめて Notion へ登録する")
 
     def _import_all_notion_only(self):
         """Notionのみの全ページを手元へ取り込む（大量データのため安全な進行同期ダイアログへ誘導）"""

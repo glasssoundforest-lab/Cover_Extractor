@@ -230,7 +230,11 @@ class PillTag(QFrame):
     def __init__(self, text, color=None, is_checkable=True, parent=None):
         super().__init__(parent)
         self.text = text
-        self.tag_color = color or Theme.BOOKMARK_COLORS.get(text, Theme.BRASS_DARK)
+        from .card_pills import player_tag_color, resolve_tag_color
+
+        self.tag_color = resolve_tag_color(text, color) or Theme.BOOKMARK_COLORS.get(text, Theme.BRASS_DARK)
+        # 人数タグは枠も人数の色にして、色分けを見分けやすくする
+        self._player_color = player_tag_color(text) if self.tag_color == player_tag_color(text) else None
         self.is_checkable = is_checkable
         self.is_checked = False
 
@@ -260,7 +264,7 @@ class PillTag(QFrame):
             bg = "#34281c"
             text_color = Theme.BRASS_LIGHT
         else:
-            border = Theme.BRASS_DARK
+            border = self._player_color or Theme.BRASS_DARK
             bg = "#1c1713"
             text_color = Theme.TEXT_WHITE
 

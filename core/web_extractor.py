@@ -517,6 +517,58 @@ class WebScenarioExtractor:
         return t or title.strip()
 
     @classmethod
+    def guess_system_from_tags(cls, tags) -> str:
+        """タグ（例: CoC・マダミス・エモクロア）から TRPG システム名を推し量る。分からなければ空文字。
+
+        タグごとにシステム名の表と照らし合わせ、表で先にあるシステムを優先する（CoC と マダミス なら CoC）。
+        """
+        names = [unicodedata.normalize("NFKC", str(t)).strip().lower() for t in (tags or []) if str(t or "").strip()]
+        for sys_name, patterns in cls.SYSTEM_PATTERNS:
+            for name in names:
+                if any(re.search(pat, name) for pat in patterns):
+                    return sys_name
+        return ""
+
+    @classmethod
+    def guess_players_from_tags(cls, tags) -> str:
+        """人数を表すタグ（例: 4PL・2〜4人・5PL以上・タイマン）からプレイ人数を推し量る。分からなければ空文字"""
+        pat = re.compile(r"^(\d+)(?:\s*[〜~\-]\s*(\d+))?\s*(?:人|名|pl)\s*(以上)?$")
+        for tag in tags or []:
+            name = unicodedata.normalize("NFKC", str(tag or "")).strip().lower()
+            if not name:
+                continue
+            if name in ("タイマン", "ソロ", "gmレス", "kpレス", "一人用"):
+                return "1人"
+            m = pat.match(name)
+            if not m:
+                continue
+            low, high, over = m.group(1), m.group(2), m.group(3)
+            if high and high != low:
+                return f"{low}〜{high}人"
+            return f"{low}人以上" if over else f"{low}人"
+        return ""
+
+    @classmethod
+    def guess_duration(cls, overview="", synopsis="") -> str:
+        """概要・あらすじの文章から所要時間を推し量る。見つからなければ空文字"""
+        for text in (overview, synopsis):
+            if text:
+                duration = re.sub(r"\s+", "", cls._extract_duration(text))
+                if duration:
+                    return duration
+        return ""
+
+    @classmethod
+    def guess_players(cls, overview="", tags=None, synopsis="") -> str:
+        """概要・あらすじの文章、なければ人数タグから、プレイ人数を推し量る。分からなければ空文字"""
+        for text in (overview, synopsis):
+            if text:
+                players = cls._extract_players(text)
+                if players:
+                    return players
+        return cls.guess_players_from_tags(tags)
+
+    @classmethod
     def _guess_system(cls, text: str) -> str:
         """テキストからTRPGシステム名を推測する"""
         text_lower = text.lower()
@@ -531,6 +583,8 @@ class WebScenarioExtractor:
         """テキストからプレイ人数（例: 2〜4人, 1人（ソロ）, 3人固定, 2PL, 1人～ 等）を抽出する"""
         # 全角英字（ＰＬ など）を半角にそろえる
         text = re.sub(r"[Ａ-Ｚａ-ｚ]", lambda c: chr(ord(c.group(0)) - 0xFEE0), text)
+        # GM/KP の人数（例: 「GM1人 + 2人」の「GM1人 +」）はプレイヤーの人数ではないので除く
+        text = re.sub(r"(?<![A-Za-z])(?:GM|KP)\s*[0-9０-９]+\s*(?:人|名)?\s*[+＋&＆・,、]?", "", text, flags=re.IGNORECASE)
         # タイマン(1人)と2PLの併記パターン（例: 2PL/PC＋KPCの一人用タイマンシナリオ, 2PLまたはタイマン, タイマン/2PL）
         taiman_2pl_pat = re.compile(
             r'(?:人数|プレイ人数|推奨人数|PL人数|PL).*?'
@@ -727,17 +781,25 @@ class WebScenarioExtractor:
     def _extract_duration(cls, text: str) -> str:
         """テキストから所要時間（例: 3〜4時間, 6時間, 30分, 30分〜1.5時間, 12時間〜 等）を抽出する"""
         qualifiers = r"(?:推定|約|およそ|目安|ボイスセッション|テキストセッション|ボイセ|半テキ|テキセ)?"
-        prefix = rf"[【\[［\(（〈《〔]?(?:所要時間|プレイ時間|想定時間|目安時間|時間|セッション時間)[】\]］\)）〉》〕]?[:：\s]*(?:{qualifiers}(?:で|：|:|\s)*)*"
+        prefix = rf"[【\[［\(（〈《〔]?(?:所要時間|プレイ時間|想定時間|目安時間|時間|セッション時間)[】\]］\)）〉》〕]?[:：…‥\s]*(?:{qualifiers}(?:で|：|:|\s)*)*"
         # 時間の単位（「4時間半」「テキセ2日」「3h」も含む）
         h_unit = r"(?:時間半?|分|日|週間|[hHｈＨ](?:ours?)?)"
         num = r"[0-9０-９]+(?:\.[0-9０-９]+)?"
-        rng = r"[〜～~\-–/]"
-        label = r"(?:所要時間|プレイ時間|想定時間|目安時間|時間|セッション時間)[】\]］\)）〉》〕]?"
+        rng = r"[〜～~∼\-–/]"
+        label = r"(?:所要時間|プレイ時間|想定時間|推定時間|目安時間|時間|セッション時間)[】\]］\)）〉》〕]?"
+        # 「1話2～3H/全体6～9H」のように全体の時間が別に書かれている行は、全体の時間を採る
+        total = re.search(rf"{label}[^\n]*?全体\s*({num}\s*{h_unit}?\s*(?:{rng}\s*{num}\s*)?{h_unit})", text)
+        if total:
+            return re.sub(r"\s+", "", re.sub(r"(?<=[0-9\s])[hHｈＨ](?:ours?)?", "時間",
+                          re.sub(r"[０-９]", lambda c: chr(ord(c.group(0)) - 0xFEE0), total.group(1))))
+        line_head = r"(?m)^[ \t\u3000・◆◇■▎●▼\-]*"
         patterns = [
             rf"{prefix}({num}\s*{h_unit}?\s*{rng}\s*{num}\s*{h_unit}(?:前後)?)",
-            rf"{prefix}({num}\s*{h_unit}(?:前後|〜|～)?)",
+            rf"{prefix}({num}\s*{h_unit}(?:前後|〜|～|∼|~)?)",
             # 見出しと数字の間に短い説明が挟まる場合（例: 「プレイ時間：短め（2時間程度）」）
-            rf"{label}\s*[:：][^\n0-9０-９]{{0,15}}?({num}\s*{h_unit}(?:\s*{rng}\s*{num}\s*{h_unit})?)",
+            rf"{label}\s*[:：…][^\n0-9０-９]{{0,15}}?({num}\s*{h_unit}(?:\s*{rng}\s*{num}\s*{h_unit})?)",
+            # 行頭の見出しの後に説明が続く場合（例: 「プレイ時間…オンラインボイスセッションで8時間程度」「プレイ時間は90分程度を想定」「プレイ時間 キャンペーン方式、合計10時間」）
+            rf"{line_head}[【\[［]?{label}[^\n0-9０-９]{{0,25}}?({num}\s*{h_unit}(?:\s*{rng}\s*{num}\s*{h_unit})?)",
             rf"({num}\s*(?:時間|分)?\s*{rng}\s*{num}\s*(?:時間半?|分))",
         ]
         for pat in patterns:
@@ -747,7 +809,7 @@ class WebScenarioExtractor:
                 val = re.sub(r"[０-９]", lambda c: chr(ord(c.group(0)) - 0xFEE0), val)
                 # h / ｈ / hours 表記を「時間」に統一（例: 1ｈ～ → 1時間～）
                 val = re.sub(r"(?<=[0-9\s])[hHｈＨ](?:ours?)?", "時間", val)
-                return val
+                return val.replace("∼", "～")
         return ""
 
     @classmethod

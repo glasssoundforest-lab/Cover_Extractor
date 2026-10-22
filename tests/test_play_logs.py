@@ -1,4 +1,4 @@
-"""冒険録（セッション履歴・プレイログ）機能の結合テスト (tests/test_play_logs.py)
+"""セッション履歴（セッション履歴・プレイログ）機能の結合テスト (tests/test_play_logs.py)
 """
 
 import os
@@ -97,7 +97,7 @@ class TestPlayLogs(unittest.TestCase):
         self.assertEqual(len(logs), 0)
 
     def test_02_dialog_integration_and_auto_passed_tag(self):
-        """詳細画面での冒険録追加と『通過済』タグ自動付与のテスト"""
+        """詳細画面でのセッション履歴追加と『通過済』タグ自動付与のテスト"""
         dlg = ItemDetailDialog(self.item_id, self.db, None, item_ids=[self.item_id])
         dlg.resize(1020, 890)
         dlg.show()

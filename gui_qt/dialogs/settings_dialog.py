@@ -36,6 +36,7 @@ from ..theme import Theme
 from ..components.ornate import OrnateFrame, OrnateDivider, make_fleur_pixmap, PillTag
 from ..components.ornate_title_bar import OrnateTitleBar
 import app_settings
+from ..error_dialog import show_error
 
 
 def make_color_circle_pixmap(color_hex, size=14):
@@ -2172,7 +2173,7 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "設定完了", "設定を保存しました。")
             self.accept()
         except Exception as e:
-            QMessageBox.warning(self, "エラー", f"保存に失敗しました: {e}")
+            show_error(self, "設定を保存する", "設定の保存に失敗しました", exc=e)
 
     # =========================================================================
     # バックアップ・復元タブ
@@ -2187,7 +2188,7 @@ class SettingsDialog(QDialog):
         # 説明ガイド
         guide_txt = (
             "💾 <b>魔導書架の保全と移送 (バックアップ・復元)</b>: 登録されたすべてのシナリオ情報、表紙画像、"
-            "タグ、ドメイン設定、セッション冒険録を一括して安全なZipファイルとして書き出し・復元できます。<br>"
+            "タグ、ドメイン設定、セッション履歴を一括して安全なZipファイルとして書き出し・復元できます。<br>"
             "<span style='color: #a8947f;'>※ PCの移行時や、万が一のデータ破損への備えとしてご活用ください。</span>"
         )
         guide_lbl = QLabel(guide_txt)
@@ -2237,7 +2238,7 @@ class SettingsDialog(QDialog):
         eb_title.setStyleSheet(f"color: {Theme.BRASS_LIGHT}; font-weight: bold; font-size: 13px; border: none;")
         eb_layout.addWidget(eb_title)
 
-        eb_desc = QLabel("現在のデータベース、表紙画像、タグ、ドメイン設定、冒険録をひとつのZipファイル（.zip）に圧縮して保存します。")
+        eb_desc = QLabel("現在のデータベース、表紙画像、タグ、ドメイン設定、セッション履歴をひとつのZipファイル（.zip）に圧縮して保存します。")
         eb_desc.setStyleSheet("color: #bfa990; font-size: 11px; border: none;")
         eb_desc.setWordWrap(True)
         eb_layout.addWidget(eb_desc)
@@ -2331,7 +2332,7 @@ class SettingsDialog(QDialog):
         self.backup_stats_lbl.setText(
             f"📚 登録シナリオ: <b>{stats['item_count']}</b> 冊　｜　"
             f"🏷 タグ: <b>{stats['tag_count']}</b> 種　｜　"
-            f"📜 冒険録: <b>{stats['playlog_count']}</b> 件"
+            f"📜 セッション履歴: <b>{stats['playlog_count']}</b> 件"
         )
 
     def _on_export_backup(self):
@@ -2359,10 +2360,11 @@ class SettingsDialog(QDialog):
                 f"書架全体のバックアップを正常に書き出しました！\n\n"
                 f"保存先: {dest_path}\n"
                 f"シナリオ数: {stats.get('item_count', 0)} 冊\n"
-                f"冒険録数: {stats.get('playlog_count', 0)} 件",
+                f"セッション履歴数: {stats.get('playlog_count', 0)} 件",
             )
         except Exception as e:
-            QMessageBox.warning(self, "バックアップ失敗", f"バックアップの作成中にエラーが発生しました:\n{e}")
+            show_error(self, "バックアップを作成する", "バックアップの作成中にエラーが発生しました", exc=e,
+                       title="バックアップ失敗")
 
     def _on_import_backup(self):
         """バックアップZipを選択して復元"""
@@ -2387,7 +2389,7 @@ class SettingsDialog(QDialog):
                 f"以下のバックアップデータを復元しますか？\n\n"
                 f"作成日時: {created_at}\n"
                 f"シナリオ数: {stats.get('item_count', 0)} 冊\n"
-                f"冒険録数: {stats.get('playlog_count', 0)} 件\n\n"
+                f"セッション履歴数: {stats.get('playlog_count', 0)} 件\n\n"
                 f"※ 現在のデータはすべてこのバックアップで置き換えられます。\n"
                 f"（安全のため、現在のデータは .bak として一時保存されます）",
                 QMessageBox.Yes | QMessageBox.No,
@@ -2412,5 +2414,5 @@ class SettingsDialog(QDialog):
                 "バックアップからの復元が正常に完了しました。\n書架のデータが最新のスナップショットに更新されました。",
             )
         except Exception as e:
-            QMessageBox.warning(self, "復元失敗", f"復元中にエラーが発生しました:\n{e}")
+            show_error(self, "バックアップから復元する", "復元中にエラーが発生しました", exc=e, title="復元失敗")
 

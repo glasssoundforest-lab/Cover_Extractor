@@ -19,7 +19,7 @@ class BackupManager:
 
     @classmethod
     def get_stats(cls, db_path: str) -> dict:
-        """指定DBの統計情報（シナリオ数、タグ数、冒険録数）を取得"""
+        """指定DBの統計情報（シナリオ数、タグ数、セッション履歴数）を取得"""
         stats = {"item_count": 0, "tag_count": 0, "playlog_count": 0}
         if not os.path.exists(db_path):
             return stats

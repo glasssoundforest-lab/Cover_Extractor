@@ -1,6 +1,6 @@
-"""セッション記録（冒険録）追加・編集ダイアログ (gui_qt/dialogs/play_log_dialog.py)
+"""セッション記録（セッション履歴）追加・編集ダイアログ (gui_qt/dialogs/play_log_dialog.py)
 
-TRPGのプレイ日、役割（GM/PL）、卓メンバー、使用キャラクター、結果（生還/ロスト）、
+TRPGのプレイ日、役割（GM/PL）、卓メンバー、GM、使用キャラクター、キャラクターシート、結果（生還/ロスト）、
 セッションメモを西洋古書調のUIで記録・編集します。
 """
 
@@ -26,17 +26,17 @@ from ..components.ornate_title_bar import OrnateTitleBar
 
 
 class PlayLogEditDialog(QDialog):
-    """西洋古書調のセッション履歴（冒険録）編集ダイアログ"""
+    """西洋古書調のセッション履歴編集ダイアログ"""
 
     def __init__(self, log_data=None, parent=None):
         super().__init__(parent)
         self.log_data = log_data or {}
         self.is_edit = bool(log_data and log_data.get("id"))
-        title_text = "冒険録の編集" if self.is_edit else "新たな冒険録を記す"
+        title_text = "セッション履歴の編集" if self.is_edit else "セッション履歴を追加"
 
         self.setWindowTitle(title_text)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
-        self.resize(520, 560)
+        self.resize(520, 630)
         self.setStyleSheet(Theme.get_application_stylesheet())
 
         layout = QVBoxLayout(self)
@@ -68,7 +68,9 @@ class PlayLogEditDialog(QDialog):
         lbl_date.setStyleSheet(f"color: {Theme.TEXT_WHITE}; font-size: 12px; font-weight: bold;")
         grid.addWidget(lbl_date, 0, 0)
 
-        self.date_edit = QLineEdit(self.log_data.get("session_date") or date.today().isoformat())
+        # 新しく記すときだけ今日の日付を入れておく（日付の無い記録を編集するときは空のまま）
+        default_date = "" if self.is_edit else date.today().isoformat()
+        self.date_edit = QLineEdit(self.log_data.get("session_date") or default_date)
         self.date_edit.setPlaceholderText("YYYY-MM-DD (例: 2026-10-17)")
         self.date_edit.setFixedHeight(28)
         self.date_edit.setStyleSheet(self._input_style())
@@ -168,9 +170,31 @@ class PlayLogEditDialog(QDialog):
         self.members_edit.setStyleSheet(self._input_style())
         grid.addWidget(self.members_edit, 4, 1)
 
+        # 6. GM
+        lbl_gm = QLabel("GM / KP:")
+        lbl_gm.setStyleSheet(f"color: {Theme.TEXT_WHITE}; font-size: 12px; font-weight: bold;")
+        grid.addWidget(lbl_gm, 5, 0)
+
+        self.gm_edit = QLineEdit(self.log_data.get("gm") or "")
+        self.gm_edit.setPlaceholderText("例: Aさん")
+        self.gm_edit.setFixedHeight(28)
+        self.gm_edit.setStyleSheet(self._input_style())
+        grid.addWidget(self.gm_edit, 5, 1)
+
+        # 7. キャラクターシート
+        lbl_sheet = QLabel("キャラクターシート:")
+        lbl_sheet.setStyleSheet(f"color: {Theme.TEXT_WHITE}; font-size: 12px; font-weight: bold;")
+        grid.addWidget(lbl_sheet, 6, 0)
+
+        self.sheet_edit = QLineEdit(self.log_data.get("sheet_url") or "")
+        self.sheet_edit.setPlaceholderText("例: いあきゃら等の URL")
+        self.sheet_edit.setFixedHeight(28)
+        self.sheet_edit.setStyleSheet(self._input_style())
+        grid.addWidget(self.sheet_edit, 6, 1)
+
         c_layout.addLayout(grid)
 
-        # 6. セッションメモ / 感想
+        # 8. セッションメモ / 感想
         lbl_memo = QLabel("冒険の記録 / メモ・感想:")
         lbl_memo.setStyleSheet(f"color: {Theme.TEXT_WHITE}; font-size: 12px; font-weight: bold;")
         c_layout.addWidget(lbl_memo)
@@ -200,7 +224,7 @@ class PlayLogEditDialog(QDialog):
         btn_bar = QHBoxLayout()
         btn_bar.addStretch()
 
-        save_btn = QPushButton("💾 冒険録を保存")
+        save_btn = QPushButton("💾 セッション履歴を保存")
         save_btn.setFixedSize(125, 30)
         save_btn.setCursor(Qt.PointingHandCursor)
         save_btn.setStyleSheet(f"""
@@ -263,8 +287,10 @@ class PlayLogEditDialog(QDialog):
         result = self.res_edit.text().strip()
         members = self.members_edit.text().strip()
         memo = self.memo_edit.toPlainText().strip()
+        gm = self.gm_edit.text().strip()
+        sheet_url = self.sheet_edit.text().strip()
 
-        if not s_date and not char_name and not memo and not result:
+        if not s_date and not char_name and not memo and not result and not members and not gm:
             QMessageBox.warning(self, "エラー", "プレイ日またはメモ、キャラクター名などを入力してください。")
             return
 
@@ -275,5 +301,7 @@ class PlayLogEditDialog(QDialog):
             "result": result,
             "party_members": members,
             "memo": memo,
+            "gm": gm,
+            "sheet_url": sheet_url,
         }
         self.accept()

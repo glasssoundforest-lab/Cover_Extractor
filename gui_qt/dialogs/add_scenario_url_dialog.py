@@ -28,6 +28,8 @@ from ..components.ornate import OrnateFrame, OrnateDivider
 from ..components.ornate_title_bar import OrnateTitleBar
 import app_settings
 from ..async_task import run_async
+from ..error_dialog import show_error
+from core import error_log
 
 
 class AddScenarioUrlDialog(QDialog):
@@ -290,7 +292,8 @@ class AddScenarioUrlDialog(QDialog):
             self.scenario_imported.emit(item_id)
             self.accept()
         except Exception as e:
-            QMessageBox.warning(self, "取り込み失敗", f"シナリオ情報の取得に失敗しました:\n{e}")
+            show_error(self, f"URL からシナリオを取り込む（{url}）", "シナリオ情報の取り込みに失敗しました", exc=e,
+                       title="取り込み失敗")
         finally:
             self.import_btn.setEnabled(True)
             self.status_lbl.setText("")
@@ -298,8 +301,11 @@ class AddScenarioUrlDialog(QDialog):
     def _on_fetch_failed(self, error):
         self.import_btn.setEnabled(True)
         self.status_lbl.setText("")
+        operation = f"URL からシナリオ情報を取得する（{self.url_input.text().strip()}）"
         if self.isVisible():
-            QMessageBox.warning(self, "取り込み失敗", f"シナリオ情報の取得に失敗しました:\n{error}")
+            show_error(self, operation, "シナリオ情報の取得に失敗しました", exc=error, title="取り込み失敗")
+        else:
+            error_log.log_error(operation, "シナリオ情報の取得に失敗しました", exc=error)
 
     @staticmethod
     def _fetch_notion(url):
@@ -335,7 +341,8 @@ class AddScenarioUrlDialog(QDialog):
             try:
                 thumb_bytes = client.download(cover_url)
             except Exception as e:
-                print(f"[AddScenarioUrl] Cover download failed: {e}")
+                error_log.log_error(f"Notion ページの表紙画像を取得する（{url}）",
+                                    "表紙画像を取得できませんでした（表紙なしで取り込みを続けます）", exc=e)
         return {"page_id": page_id, "page": page, "thumb_bytes": thumb_bytes}
 
     def _import_from_notion(self, url, fetched=None):

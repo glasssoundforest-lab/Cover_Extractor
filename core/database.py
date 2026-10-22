@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 import re
 import unicodedata
@@ -314,6 +315,9 @@ class Database:
         self.conn = sqlite3.connect(db_path, timeout=10.0)
         self.conn.execute("PRAGMA foreign_keys = ON;")
         self.init_db()
+        self._fill_notion_systems_from_tags_once()
+        self._fill_notion_players_once()
+        self._fill_notion_durations_once()
 
     def init_db(self):
         with self.conn:
@@ -333,7 +337,8 @@ class Database:
                 );
             """)
             for col in ["overview", "synopsis", "source_url", "title_kana", "last_opened_at", "notion_page_id", "notion_cover_hash",
-                        "author", "play_status", "notion_last_edited_time", "notion_url", "notion_sync_hash"]:
+                        "author", "play_status", "notion_last_edited_time", "notion_url", "notion_sync_hash",
+                        "notion_deleted_page_id"]:
                 try:
                     self.conn.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT;")
                 except sqlite3.OperationalError:
@@ -414,10 +419,83 @@ class Database:
                     FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
                 );
             """)
+            # gm: GM・KP の名前 / sheet_url: キャラクターシートの URL
+            # notion_page_id・notion_hash: Notion から取り込んだ記録の目印と、取り込んだ内容の要約
+            for col in ["gm", "sheet_url", "notion_page_id", "notion_hash"]:
+                try:
+                    self.conn.execute(f"ALTER TABLE play_logs ADD COLUMN {col} TEXT;")
+                except sqlite3.OperationalError:
+                    pass
 
             init_cover_cache(self.conn)
             # 同調などの進み具合（例: Notion からどの更新日時まで読み込んだか）
             self.conn.execute("CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT);")
+
+    def _fill_notion_systems_from_tags_once(self):
+        """Notion から取り込んだ本のうちシステムが空のものに、タグ（CoC・マダミス等）から決めたシステムを入れる。
+
+        Notion にシステムの列が無いと、取り込んだ本のシステムが空のままになっていたため、一度だけ補う
+        （これ以降に取り込む本は、取り込むときにタグからシステムを決める）。
+        """
+        key = "notion_system_from_tags_v1"
+        if self.get_sync_state(key):
+            return
+        rows = self.conn.execute("""
+            SELECT id FROM items
+            WHERE (notion_page_id IS NOT NULL AND notion_page_id != '' OR file_path LIKE 'notion://%')
+              AND (system_name IS NULL OR TRIM(system_name) = '');
+        """).fetchall()
+        if rows:
+            from core.web_extractor import WebScenarioExtractor
+
+            with self.conn:
+                for (item_id,) in rows:
+                    tags = [t[1] for t in self.get_item_tags(item_id)]
+                    system = WebScenarioExtractor.guess_system_from_tags(tags)
+                    if system:
+                        self.conn.execute("UPDATE items SET system_name = ? WHERE id = ?;", (system, item_id))
+        self.set_sync_state(key, "done")
+
+    def _fill_notion_players_once(self):
+        """Notion から取り込んだ本のうち人数が空のものに、概要の文章や人数のタグから決めた人数を一度だけ入れる"""
+        key = "notion_players_infer_v1"
+        if self.get_sync_state(key):
+            return
+        rows = self.conn.execute("""
+            SELECT id, overview, synopsis FROM items
+            WHERE (notion_page_id IS NOT NULL AND notion_page_id != '' OR file_path LIKE 'notion://%')
+              AND (players_text IS NULL OR TRIM(players_text) = '');
+        """).fetchall()
+        if rows:
+            from core.web_extractor import WebScenarioExtractor
+
+            with self.conn:
+                for item_id, overview, synopsis in rows:
+                    tags = [t[1] for t in self.get_item_tags(item_id)]
+                    players = WebScenarioExtractor.guess_players(overview or "", tags, synopsis or "")
+                    if players:
+                        self.conn.execute("UPDATE items SET players_text = ? WHERE id = ?;", (players, item_id))
+        self.set_sync_state(key, "done")
+
+    def _fill_notion_durations_once(self):
+        """Notion から取り込んだ本のうち所要時間が空のものに、概要の文章から決めた所要時間を一度だけ入れる"""
+        key = "notion_duration_infer_v1"
+        if self.get_sync_state(key):
+            return
+        rows = self.conn.execute("""
+            SELECT id, overview, synopsis FROM items
+            WHERE (notion_page_id IS NOT NULL AND notion_page_id != '' OR file_path LIKE 'notion://%')
+              AND (duration_text IS NULL OR TRIM(duration_text) = '');
+        """).fetchall()
+        if rows:
+            from core.web_extractor import WebScenarioExtractor
+
+            with self.conn:
+                for item_id, overview, synopsis in rows:
+                    duration = WebScenarioExtractor.guess_duration(overview or "", synopsis or "")
+                    if duration:
+                        self.conn.execute("UPDATE items SET duration_text = ? WHERE id = ?;", (duration, item_id))
+        self.set_sync_state(key, "done")
 
     def save_item(self, file_path, title, system_name, players_text, duration_text, overview, synopsis, thumbnail_bytes):
         file_path = clean_text(file_path, max_len=1000)
@@ -448,11 +526,34 @@ class Database:
         with self.conn:
             self.conn.execute("UPDATE items SET thumbnail = ? WHERE id = ?;", (thumbnail_bytes, item_id))
 
-    def delete_item(self, item_id):
-        """指定したシナリオアイテムおよび関連タグをデータベースから安全に削除する"""
+    def delete_item(self, item_id, ignore_notion_page=None):
+        """指定したシナリオアイテムおよび関連タグ・セッション履歴をデータベースから安全に削除する。
+
+        ignore_notion_page: 手元だけで破棄した本の Notion ページ。同調でこのページを取り込み直さないよう覚えておく
+        """
         with self.conn:
             self.conn.execute("DELETE FROM item_tags WHERE item_id = ?;", (item_id,))
+            self.conn.execute("DELETE FROM play_logs WHERE item_id = ?;", (item_id,))
             self.conn.execute("DELETE FROM items WHERE id = ?;", (item_id,))
+        if ignore_notion_page:
+            ignored = self.get_ignored_notion_pages()
+            ignored.add(ignore_notion_page)
+            self.set_sync_state(self._IGNORED_NOTION_PAGES_KEY, json.dumps(sorted(ignored)))
+
+    _IGNORED_NOTION_PAGES_KEY = "notion_ignored_pages"
+
+    def get_ignored_notion_pages(self):
+        """手元だけで破棄したため、同調で取り込まない Notion ページ"""
+        try:
+            return set(json.loads(self.get_sync_state(self._IGNORED_NOTION_PAGES_KEY) or "[]"))
+        except (TypeError, ValueError):
+            return set()
+
+    def unignore_notion_page(self, page_id):
+        ignored = self.get_ignored_notion_pages()
+        if page_id in ignored:
+            ignored.discard(page_id)
+            self.set_sync_state(self._IGNORED_NOTION_PAGES_KEY, json.dumps(sorted(ignored)) if ignored else None)
 
     def update_item_meta(self, item_id, title, system_name, players_text, duration_text, title_kana=None, author=None):
         system_name = canonical_system(system_name)
@@ -550,7 +651,8 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT id, file_path, title, title_kana, author, system_name, players_text, duration_text, overview, synopsis,
-                   source_url, thumbnail, notion_page_id, notion_cover_hash, notion_last_edited_time, notion_sync_hash
+                   source_url, thumbnail, notion_page_id, notion_cover_hash, notion_last_edited_time, notion_sync_hash,
+                   notion_deleted_page_id
             FROM items ORDER BY id;
         """)
         cols = [d[0] for d in cursor.description]
@@ -582,14 +684,35 @@ class Database:
         with self.conn:
             if cover_hash is None:
                 self.conn.execute(
-                    "UPDATE items SET notion_page_id = ?, notion_url = COALESCE(?, notion_url) WHERE id = ?;",
+                    "UPDATE items SET notion_page_id = ?, notion_url = COALESCE(?, notion_url), "
+                    "notion_deleted_page_id = NULL WHERE id = ?;",
                     (page_id, notion_url, item_id),
                 )
             else:
                 self.conn.execute(
-                    "UPDATE items SET notion_page_id = ?, notion_cover_hash = ?, notion_url = COALESCE(?, notion_url) WHERE id = ?;",
+                    "UPDATE items SET notion_page_id = ?, notion_cover_hash = ?, notion_url = COALESCE(?, notion_url), "
+                    "notion_deleted_page_id = NULL WHERE id = ?;",
                     (page_id, cover_hash, notion_url, item_id),
                 )
+
+    def unlink_deleted_notion_page(self, item_id, page_id):
+        """Notion 側でページが削除（ゴミ箱へ移動）されていた本を、そのページとの連携から外す。
+
+        手元の本は残す。外した本は、同調で Notion に新しいページとして作り直さない
+        （Notion で消したものが勝手に戻ってこないように）。Notion でページを元に戻すか、
+        差分確認画面から登録し直すと、また連携する。
+        """
+        with self.conn:
+            self.conn.execute(
+                """UPDATE items SET notion_deleted_page_id = ?, notion_page_id = NULL, notion_sync_hash = NULL,
+                       notion_last_edited_time = NULL
+                   WHERE id = ?;""",
+                (page_id, item_id),
+            )
+
+    def get_notion_deleted_page_id(self, item_id):
+        row = self.conn.execute("SELECT notion_deleted_page_id FROM items WHERE id = ?;", (item_id,)).fetchone()
+        return (row[0] if row else None) or ""
 
     def get_notion_page_id(self, item_id):
         """指定アイテムのNotionページIDを取得する"""
@@ -723,6 +846,8 @@ class Database:
         import hashlib
 
         page_id = clean_text(page_id, max_len=100) or ""
+        if page_id:
+            self.unignore_notion_page(page_id)
         raw_fp = clean_text(values.get("file_path"), max_len=1000)
         file_path = raw_fp if raw_fp else f"notion://{page_id}"
 
@@ -752,6 +877,20 @@ class Database:
 
         if existing_row:
             item_id, old_fp, old_thumb = existing_row
+            if values.get("system_from_tags"):
+                # タグから推し量ったシステムは、手元でシステムが空のときだけ入れる
+                old_system = self.conn.execute("SELECT system_name FROM items WHERE id = ?;", (item_id,)).fetchone()[0]
+                if (old_system or "").strip():
+                    system_name = None
+            if values.get("players_inferred"):
+                # 概要やタグから推し量った人数は、手元で人数が空のときだけ入れる
+                old_players = self.conn.execute("SELECT players_text FROM items WHERE id = ?;", (item_id,)).fetchone()[0]
+                if (old_players or "").strip():
+                    players_text = None
+            if values.get("duration_inferred"):
+                old_duration = self.conn.execute("SELECT duration_text FROM items WHERE id = ?;", (item_id,)).fetchone()[0]
+                if (old_duration or "").strip():
+                    duration_text = None
             final_fp = raw_fp if raw_fp else old_fp
             final_thumb = thumbnail_bytes if thumbnail_bytes is not None else old_thumb
             with self.conn:
@@ -772,7 +911,8 @@ class Database:
                         notion_page_id = ?,
                         notion_cover_hash = COALESCE(?, notion_cover_hash),
                         notion_last_edited_time = COALESCE(?, notion_last_edited_time),
-                        notion_url = COALESCE(?, notion_url)
+                        notion_url = COALESCE(?, notion_url),
+                        notion_deleted_page_id = NULL
                     WHERE id = ?;
                     """,
                     (
@@ -863,6 +1003,10 @@ class Database:
             if tid and tid not in tag_ids:
                 tag_ids.append(tid)
         self.set_item_tags(item_id, tag_ids)
+
+        # 通過日・GM・PC名・同卓者などの列が Notion にあれば、セッション履歴として取り込む
+        if "play_log" in values:
+            self.apply_notion_play_log(item_id, page_id, values["play_log"])
 
         return item_id
 
@@ -1346,29 +1490,97 @@ class Database:
             return new_state
 
     # -------------------------------------------------------------------------
-    # 冒険録（プレイ履歴・セッション記録）
+    # セッション履歴（プレイ履歴・セッション記録）
     # -------------------------------------------------------------------------
-    def add_play_log(self, item_id, session_date="", role="PL", party_members="", character_name="", result="", memo=""):
+    @staticmethod
+    def _clean_play_log_fields(session_date, role, party_members, character_name, result, memo, gm, sheet_url):
+        return (
+            clean_text(session_date, max_len=50) or "",
+            clean_text(role, max_len=50) or "PL",
+            clean_text(party_members, max_len=1000) or "",
+            clean_text(character_name, max_len=200) or "",
+            clean_text(result, max_len=100) or "",
+            clean_text(memo, max_len=5000, keep_newlines=True) or "",
+            clean_text(gm, max_len=200) or "",
+            clean_text(sheet_url, max_len=1000) or "",
+        )
+
+    def add_play_log(self, item_id, session_date="", role="PL", party_members="", character_name="", result="", memo="",
+                     gm="", sheet_url=""):
         """セッション記録を追加する"""
-        session_date = clean_text(session_date, max_len=50) or ""
-        role = clean_text(role, max_len=50) or "PL"
-        party_members = clean_text(party_members, max_len=200) or ""
-        character_name = clean_text(character_name, max_len=100) or ""
-        result = clean_text(result, max_len=100) or ""
-        memo = clean_text(memo, max_len=5000, keep_newlines=True) or ""
+        fields = self._clean_play_log_fields(session_date, role, party_members, character_name, result, memo, gm, sheet_url)
         with self.conn:
             cursor = self.conn.cursor()
             cursor.execute("""
-                INSERT INTO play_logs (item_id, session_date, role, party_members, character_name, result, memo)
-                VALUES (?, ?, ?, ?, ?, ?, ?);
-            """, (item_id, session_date, role, party_members, character_name, result, memo))
+                INSERT INTO play_logs (item_id, session_date, role, party_members, character_name, result, memo, gm, sheet_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (item_id, *fields))
             return cursor.lastrowid
+
+    def set_tags_from_notion(self, item_id, raw_tags):
+        """Notion のタグ一式を、その本のタグにする（同調で取り込むときと同じく、名前をそろえてから付け替える）"""
+        if isinstance(raw_tags, str):
+            raw_tags = [v.strip() for v in re.split(r"[、,]", raw_tags) if v.strip()]
+        tag_ids = []
+        for t in raw_tags or []:
+            canon = canonical_tag(str(t).strip())
+            if not canon or is_excluded_tag(canon):
+                continue
+            tid = self.add_tag(canon)
+            if tid and tid not in tag_ids:
+                tag_ids.append(tid)
+        self.set_item_tags(item_id, tag_ids)
+
+    def apply_notion_play_log(self, item_id, page_id, log):
+        """Notion のページにある通過記録（通過日・GM・PC名・同卓者など）を、その本のセッション履歴 1 件として取り込む。
+
+        Notion から取り込んだ記録は page_id で見分け、Notion 側の内容が前回から変わったときだけ書き換える
+        （手元で直した記録を、Notion が変わっていないのに上書きしないため）。
+        Notion 側の記録が空になったら、取り込んだ記録を消す。手元で追加した記録には触れない。
+        戻り値: セッション履歴を変えたら True
+        """
+        if not item_id or not page_id:
+            return False
+        row = self.conn.execute(
+            "SELECT id, notion_hash FROM play_logs WHERE item_id = ? AND notion_page_id = ? ORDER BY id LIMIT 1;",
+            (item_id, page_id),
+        ).fetchone()
+        if not log:
+            if row:
+                with self.conn:
+                    self.conn.execute("DELETE FROM play_logs WHERE id = ?;", (row[0],))
+                return True
+            return False
+
+        fields = self._clean_play_log_fields(
+            log.get("session_date"), log.get("role") or "PL (プレイヤー)", log.get("party_members"),
+            log.get("character_name"), log.get("result"), log.get("memo"), log.get("gm"), log.get("sheet_url"),
+        )
+        new_hash = hashlib.sha256("\x1f".join(fields).encode("utf-8")).hexdigest()[:16]
+        if row and row[1] == new_hash:
+            return False
+        with self.conn:
+            if row:
+                self.conn.execute("""
+                    UPDATE play_logs
+                    SET session_date = ?, role = ?, party_members = ?, character_name = ?, result = ?, memo = ?,
+                        gm = ?, sheet_url = ?, notion_hash = ?
+                    WHERE id = ?;
+                """, (*fields, new_hash, row[0]))
+            else:
+                self.conn.execute("""
+                    INSERT INTO play_logs (item_id, session_date, role, party_members, character_name, result, memo,
+                                           gm, sheet_url, notion_page_id, notion_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (item_id, *fields, page_id, new_hash))
+        return True
 
     def get_play_logs(self, item_id):
         """指定アイテムの全セッション記録を取得する（日付降順）"""
         cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT id, item_id, session_date, role, party_members, character_name, result, memo, created_at
+            SELECT id, item_id, session_date, role, party_members, character_name, result, memo, created_at,
+                   gm, sheet_url, notion_page_id
             FROM play_logs
             WHERE item_id = ?
             ORDER BY COALESCE(NULLIF(session_date, ''), '0000-00-00') DESC, id DESC;
@@ -1386,23 +1598,26 @@ class Database:
                 "result": r[6] or "",
                 "memo": r[7] or "",
                 "created_at": r[8] or "",
+                "gm": r[9] or "",
+                "sheet_url": r[10] or "",
+                "notion_page_id": r[11] or "",
             })
         return result
 
-    def update_play_log(self, log_id, session_date="", role="PL", party_members="", character_name="", result="", memo=""):
-        """セッション記録を更新する"""
-        session_date = clean_text(session_date, max_len=50) or ""
-        role = clean_text(role, max_len=50) or "PL"
-        party_members = clean_text(party_members, max_len=200) or ""
-        character_name = clean_text(character_name, max_len=100) or ""
-        result = clean_text(result, max_len=100) or ""
-        memo = clean_text(memo, max_len=5000, keep_newlines=True) or ""
+    def update_play_log(self, log_id, session_date="", role="PL", party_members="", character_name="", result="", memo="",
+                        gm=None, sheet_url=None):
+        """セッション記録を更新する（gm・sheet_url を省略したときは元の値のまま）"""
+        fields = self._clean_play_log_fields(
+            session_date, role, party_members, character_name, result, memo, gm or "", sheet_url or ""
+        )
         with self.conn:
             self.conn.execute("""
                 UPDATE play_logs
-                SET session_date = ?, role = ?, party_members = ?, character_name = ?, result = ?, memo = ?
+                SET session_date = ?, role = ?, party_members = ?, character_name = ?, result = ?, memo = ?,
+                    gm = CASE WHEN ? THEN ? ELSE gm END,
+                    sheet_url = CASE WHEN ? THEN ? ELSE sheet_url END
                 WHERE id = ?;
-            """, (session_date, role, party_members, character_name, result, memo, log_id))
+            """, (*fields[:6], gm is not None, fields[6], sheet_url is not None, fields[7], log_id))
 
     def delete_play_log(self, log_id):
         """セッション記録を削除する"""

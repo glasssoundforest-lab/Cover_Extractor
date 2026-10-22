@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..theme import Theme
+from core import error_log
 from ..components.ornate import OrnateFrame, OrnateDivider, make_fleur_pixmap
 from core.extractor import extract_scenario_data
 
@@ -33,6 +34,7 @@ class ImportWorker(QThread):
         self.targets = targets
         self.extractor = extractor
         self.db_path = getattr(db, "db_path", "catalog.db")
+        self.errors = []  # 取り込めなかったファイルごとのエラー（error.log と同じ形式の文章）
 
     def run(self):
         from core.database import Database
@@ -66,7 +68,10 @@ class ImportWorker(QThread):
                     worker_db.add_tags_to_item(item_id, list(data["tags"]))
                 success_count += 1
             except Exception as e:
-                print(f"[ImportWorker] Error processing {target}: {e}")
+                self.errors.append(error_log.build_entry(
+                    f"シナリオファイルを取り込む（{target}）", str(e) or type(e).__name__,
+                    error_log.exception_detail(e),
+                ))
                 fail_count += 1
 
         self.finished_all.emit(success_count, fail_count)
@@ -81,6 +86,7 @@ class ImportProgressDialog(QDialog):
         self.db = db
         self.success_count = 0
         self.fail_count = 0
+        self.errors = []
 
         self.setWindowTitle("書架への収蔵処理")
         self.setFixedSize(480, 220)
@@ -193,6 +199,7 @@ class ImportProgressDialog(QDialog):
     def _on_finished(self, success_count, fail_count):
         self.success_count = success_count
         self.fail_count = fail_count
+        self.errors = list(getattr(self.worker, "errors", []))
         if hasattr(self, "worker") and self.worker.isRunning():
             self.worker.wait(1000)
         self.accept()

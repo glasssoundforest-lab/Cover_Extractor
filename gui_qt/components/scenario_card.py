@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from ..theme import Theme
 from core.database import global_tag_sort_key
 from .ornate import make_fleur_pixmap, PillTag
+from .card_pills import CardPill, system_pill_info, players_pill_info
 
 
 # -----------------------------------------------------------------------------
@@ -781,23 +782,35 @@ class ScenarioCard(_StyledCardMixin, QFrame):
         self.title_label.setGraphicsEffect(self.title_shadow)
         overlay_layout.addWidget(self.title_label)
 
-        # 概要情報（システム名 │ 人数 │ 時間 ＋ ドロップシャドウ）
-        meta_parts = [self.system_text]
-        if self.players_text:
-            pt = self.players_text if ("人" in self.players_text or "PL" in self.players_text) else f"{self.players_text}人"
-            meta_parts.append(pt)
-        if self.duration_text:
-            meta_parts.append(self.duration_text)
-        meta_text = " │ ".join(meta_parts)
+        # 概要情報の行: システム・人数はピルアイコン、時間は文字（ドロップシャドウ付き）
+        pill_px = self.cfg["font_sub"] + 3
+        self.meta_row = QWidget()
+        self.meta_row.setAttribute(Qt.WA_TranslucentBackground, True)
+        meta_layout = QHBoxLayout(self.meta_row)
+        meta_layout.setContentsMargins(0, 0, 0, 0)
+        meta_layout.setSpacing(4)
 
-        self.meta_label = QLabel(meta_text)
+        sys_label, sys_color = system_pill_info(item[3])
+        self.system_pill = CardPill(sys_label, sys_color, pill_px)
+        meta_layout.addWidget(self.system_pill)
+
+        self.players_pill = None
+        players_info = players_pill_info(self.players_text)
+        if players_info:
+            self.players_pill = CardPill(players_info[0], players_info[1], pill_px)
+            meta_layout.addWidget(self.players_pill)
+
+        self.meta_label = QLabel(self.duration_text)
         self.meta_label.setObjectName("cardMeta")
         self.meta_label.setTextFormat(Qt.PlainText)
         self.meta_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.meta_shadow = _CachedDropShadow(self.meta_label)
         self.meta_shadow.setOffset(1, 1)
         self.meta_label.setGraphicsEffect(self.meta_shadow)
-        overlay_layout.addWidget(self.meta_label)
+        self.meta_label.setVisible(bool(self.duration_text))
+        meta_layout.addWidget(self.meta_label)
+        meta_layout.addStretch()
+        overlay_layout.addWidget(self.meta_row)
 
         # 互換用ダミー（テストや外部参照用）
         self.sys_label = QLabel(self.system_text)
@@ -975,7 +988,10 @@ class ScenarioCard(_StyledCardMixin, QFrame):
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
+            # 既定の処理（もう一度クリックとして扱う）は不要。ここで終える
+            event.accept()
             self.double_clicked.emit(self.item_id)
+            return
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
@@ -1199,7 +1215,10 @@ class ScenarioListCard(_StyledCardMixin, QFrame):
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
+            # 既定の処理（もう一度クリックとして扱う）は不要。ここで終える
+            event.accept()
             self.double_clicked.emit(self.item_id)
+            return
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):

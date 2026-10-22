@@ -964,7 +964,10 @@ class TestNotionImportToDB(unittest.TestCase):
         from gui_qt.dialogs.notion_diff_dialog import NotionDiffDialog
 
         test_db = Database(os.path.join(self.tmp_dir, "test_diff_dlg.db"))
-        dlg = NotionDiffDialog(test_db)
+        # 照合（Notion への接続）は始めない。始めると本物の Notion へ通信し、
+        # 失敗のダイアログが後の別のテスト中に開いて止まってしまう
+        with patch.object(NotionDiffDialog, "_start_audit", lambda self: None):
+            dlg = NotionDiffDialog(test_db)
         self.assertIsNotNone(dlg.tabs)
         self.assertEqual(dlg.tabs.count(), 3)
         self.assertIn("手元のみ", dlg.tabs.tabText(0))

@@ -9,6 +9,7 @@
 - タグの複数チェック編集ダイアログ
 """
 
+import html
 import os
 import sys
 import subprocess
@@ -40,7 +41,9 @@ from ..components.ornate import OrnateFrame, OrnateDivider, PillTag, make_fleur_
 from ..components.ornate_title_bar import OrnateTitleBar
 from .web_info_diff_dialog import WebInfoComparisonDialog
 from ..async_task import run_async
+from ..error_dialog import show_error
 import app_settings
+import notion_sync
 
 
 def make_tag_color_circle(color_hex, size=12):
@@ -56,13 +59,18 @@ def make_tag_color_circle(color_hex, size=12):
 
 
 class MultiTagEditDialog(QDialog):
-    """西洋古書調のローカルタグ設定ダイアログ（自由タグの選択と追加）"""
-    def __init__(self, item_id, db, parent=None):
+    """西洋古書調のタグ設定ダイアログ（タグ一覧から選択。ローカルタグは追加もできる）
+
+    is_global=True のときはグローバルタグ（CoC・マダミス・未通過など）の一覧から選ぶ。
+    """
+    def __init__(self, item_id, db, parent=None, is_global=False):
         super().__init__(parent)
         self.item_id = item_id
         self.db = db
+        self.is_global = bool(is_global)
+        kind = "グローバルタグ" if self.is_global else "ローカルタグ"
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
-        self.setWindowTitle("ローカルタグの設定")
+        self.setWindowTitle(f"{kind}の設定")
         self.resize(380, 460)
         self.setStyleSheet(Theme.get_application_stylesheet())
 
@@ -77,7 +85,7 @@ class MultiTagEditDialog(QDialog):
         f_layout.setSpacing(10)
 
         # 画面デザイン一体型タイトルバー
-        self.title_bar = OrnateTitleBar("ローカルタグの設定", parent=self, show_close=True)
+        self.title_bar = OrnateTitleBar(f"{kind}の設定", parent=self, show_close=True)
         f_layout.addWidget(self.title_bar)
 
         content_widget = QWidget()
@@ -86,7 +94,10 @@ class MultiTagEditDialog(QDialog):
         layout.setSpacing(10)
         f_layout.addWidget(content_widget)
 
-        sub_head = QLabel("※ このシナリオに付与する自由なローカルタグを選択・作成してください。")
+        if self.is_global:
+            sub_head = QLabel("※ このシナリオに付与するグローバルタグを一覧から選択してください。")
+        else:
+            sub_head = QLabel("※ このシナリオに付与する自由なローカルタグを選択・作成してください。")
         sub_head.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 11px;")
         layout.addWidget(sub_head)
 
@@ -99,8 +110,8 @@ class MultiTagEditDialog(QDialog):
         self.c_layout.setContentsMargins(12, 10, 12, 10)
         self.c_layout.setSpacing(8)
 
-        local_tags = self.db.get_local_tags()
-        current_local_ids = {t[0] for t in self.db.get_item_tags(self.item_id, is_global=False)}
+        local_tags = self.db.get_global_tags() if self.is_global else self.db.get_local_tags()
+        current_local_ids = {t[0] for t in self.db.get_item_tags(self.item_id, is_global=self.is_global)}
 
         self.checkboxes = {}
         for tag_tuple in local_tags:
@@ -110,7 +121,8 @@ class MultiTagEditDialog(QDialog):
             self._add_tag_row(tid, tname, tcolor, is_checked=(tid in current_local_ids))
 
         if not local_tags:
-            self.empty_lbl = QLabel("（登録されたローカルタグはありません。下の欄から自由に追加できます）")
+            self.empty_lbl = QLabel("（登録されたグローバルタグはありません）" if self.is_global
+                                    else "（登録されたローカルタグはありません。下の欄から自由に追加できます）")
             self.empty_lbl.setStyleSheet("color: #776655; font-size: 11px; font-style: italic;")
             self.c_layout.addWidget(self.empty_lbl)
         else:
@@ -162,6 +174,10 @@ class MultiTagEditDialog(QDialog):
         add_tag_btn.clicked.connect(self._add_new_tag)
         new_tag_bar.addWidget(add_tag_btn)
         layout.addLayout(new_tag_bar)
+        if self.is_global:
+            # グローバルタグの追加・削除は設定画面で行う。ここでは一覧からの選択だけ
+            self.new_tag_in.hide()
+            add_tag_btn.hide()
 
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bbox.accepted.connect(self.accept)
@@ -228,6 +244,7 @@ class MultiTagEditDialog(QDialog):
 class ItemDetailDialog(QDialog):
     """西洋古書・グリモワール調のシナリオ詳細・あらすじ編集ダイアログ（お手本画像完全準拠）"""
     item_updated = Signal(int)
+    item_deleted = Signal(int)  # シナリオを破棄した（書架から消えた）
 
     def __init__(self, item_id, db, extractor=None, item_ids=None, parent=None):
         super().__init__(parent)
@@ -287,9 +304,9 @@ class ItemDetailDialog(QDialog):
 
         content_widget = QWidget()
         dialog_layout = QHBoxLayout(content_widget)
-        dialog_layout.setContentsMargins(24, 16, 24, 20)
+        dialog_layout.setContentsMargins(24, 16, 24, 6)
         dialog_layout.setSpacing(24)
-        root_layout.addWidget(content_widget)
+        root_layout.addWidget(content_widget, 1)
 
         # =====================================================================
         # 1. 左側カラム（幅 270px）: 表紙画像・表紙変更ボタン・タグ表示枠・タグ編集ボタン
@@ -418,52 +435,85 @@ class ItemDetailDialog(QDialog):
 
         left_layout.addSpacing(14)
 
-        # 1.2 「タグ」見出し
-        tag_head = QLabel("タグ")
-        tag_head.setStyleSheet(f"color: {Theme.TEXT_WHITE}; font-size: 14px; font-family: {Theme.FONT_SERIF};")
-        left_layout.addWidget(tag_head)
-
+        # 1.2 タグ領域（グローバルタグとローカルタグを分けて表示・編集する）
         # テスト・内部互換用（text()取得用）
         self.tags_box = QLabel("-")
         self.tags_box.hide()
 
-        # タグ表示枠（長方形の短辺が丸いボタンぽいもの＝PillTag に統一）
-        self.tags_container = QFrame()
-        self.tags_container.setMinimumHeight(44)
-        self.tags_container.setStyleSheet(f"""
-            QFrame {{
-                background-color: #14100c;
-                border: 1px solid #3d3023;
-                border-radius: 4px;
-            }}
-        """)
-        self.tags_flow_layout = QVBoxLayout(self.tags_container)
-        self.tags_flow_layout.setContentsMargins(8, 8, 8, 8)
-        self.tags_flow_layout.setSpacing(6)
-        left_layout.addWidget(self.tags_container)
+        def make_tag_area(title, edit_label, on_edit):
+            head = QLabel(title)
+            head.setStyleSheet(f"color: {Theme.TEXT_WHITE}; font-size: 14px; font-family: {Theme.FONT_SERIF};")
+            left_layout.addWidget(head)
 
-        # タグ編集ボタン
-        self.edit_tags_btn = QPushButton("🏷  ローカルタグを編集")
-        self.edit_tags_btn.setFixedHeight(32)
-        self.edit_tags_btn.setCursor(Qt.PointingHandCursor)
-        self.edit_tags_btn.setStyleSheet(f"""
+            # タグ表示枠（長方形の短辺が丸いボタンぽいもの＝PillTag に統一）
+            container = QFrame()
+            container.setMinimumHeight(44)
+            container.setStyleSheet(f"""
+                QFrame {{
+                    background-color: #14100c;
+                    border: 1px solid #3d3023;
+                    border-radius: 4px;
+                }}
+            """)
+            flow = QVBoxLayout(container)
+            flow.setContentsMargins(8, 8, 8, 8)
+            flow.setSpacing(6)
+            left_layout.addWidget(container)
+
+            btn = QPushButton(edit_label)
+            btn.setFixedHeight(32)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #1a1410;
+                    color: {Theme.BRASS_LIGHT};
+                    border: 1px solid #4a3a2a;
+                    border-radius: 2px;
+                    font-size: 12px;
+                    font-family: {Theme.FONT_SERIF};
+                }}
+                QPushButton:hover {{
+                    background-color: #281f18;
+                    border: 1px solid {Theme.BRASS_LIGHT};
+                    color: #ffffff;
+                }}
+            """)
+            btn.clicked.connect(on_edit)
+            btn.hide()  # 閲覧モードでは非表示
+            left_layout.addWidget(btn)
+            return container, flow, btn
+
+        self.global_tags_container, self.global_flow_layout, self.edit_global_tags_btn = make_tag_area(
+            "グローバルタグ", "🔖  グローバルタグを編集", self._on_edit_global_tags)
+        left_layout.addSpacing(8)
+        self.tags_container, self.tags_flow_layout, self.edit_tags_btn = make_tag_area(
+            "ローカルタグ", "🏷  ローカルタグを編集", self._on_edit_tags)
+
+        # シナリオ破棄ボタン
+        self.discard_btn = QPushButton("🗑  このシナリオを破棄")
+        self.discard_btn.setFixedHeight(32)
+        self.discard_btn.setCursor(Qt.PointingHandCursor)
+        self.discard_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: #1a1410;
-                color: {Theme.BRASS_LIGHT};
-                border: 1px solid #4a3a2a;
+                color: #d98c8c;
+                border: 1px solid #5a3030;
                 border-radius: 2px;
                 font-size: 12px;
                 font-family: {Theme.FONT_SERIF};
             }}
             QPushButton:hover {{
-                background-color: #281f18;
-                border: 1px solid {Theme.BRASS_LIGHT};
+                background-color: #3a1c1c;
+                border: 1px solid #d98c8c;
                 color: #ffffff;
             }}
+            QPushButton:disabled {{
+                color: #6a5050;
+            }}
         """)
-        self.edit_tags_btn.clicked.connect(self._on_edit_tags)
-        self.edit_tags_btn.hide()  # 閲覧モードでは非表示
-        left_layout.addWidget(self.edit_tags_btn)
+        self.discard_btn.clicked.connect(self._on_discard_clicked)
+        self.discard_btn.hide()  # 閲覧モードでは非表示
+        left_layout.addWidget(self.discard_btn)
 
         left_layout.addStretch()
         dialog_layout.addWidget(left_panel)
@@ -851,7 +901,7 @@ class ItemDetailDialog(QDialog):
         syn_layout.addWidget(self.synopsis_edit)
         right_layout.addWidget(syn_container)
 
-        # 2.5 「❖ 冒険録 (セッション履歴) ――――――――――――」＋「＋ 記録を追加」ボタン
+        # 2.5 「❖ セッション履歴 ――――――――――――」＋「＋ 記録を追加」ボタン（編集画面のみ）
         playlog_header_layout = QHBoxLayout()
         playlog_header_layout.setContentsMargins(0, 0, 0, 0)
         playlog_header_layout.setSpacing(10)
@@ -861,7 +911,7 @@ class ItemDetailDialog(QDialog):
         pl_icon.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         playlog_header_layout.addWidget(pl_icon)
 
-        pl_title = QLabel("冒険録 (セッション履歴)")
+        pl_title = QLabel("セッション履歴")
         pl_title.setStyleSheet(f"""
             color: {Theme.BRASS_LIGHT};
             font-size: 15px;
@@ -894,6 +944,7 @@ class ItemDetailDialog(QDialog):
             }}
         """)
         self.add_playlog_btn.clicked.connect(self._on_add_play_log)
+        self.add_playlog_btn.hide()
         playlog_header_layout.addWidget(self.add_playlog_btn)
         right_layout.addLayout(playlog_header_layout)
 
@@ -908,10 +959,35 @@ class ItemDetailDialog(QDialog):
         right_scroll.setWidget(right_panel)
         right_main_layout.addWidget(right_scroll, 1)
 
-        # 2.6 下部アクションバー（左: ◀ 前の書物 / インジケーター / 次の書物 ▶、右: ✎ 編集 / 💾 保存 / ✕ 取消）
+        # 2.6 下部アクションバー（中央: ◀ 前の書物 / インジケーター / 次の書物 ▶、右: ✎ 編集 / 💾 保存 / ✕ 取消）
+        #     ページめくりはバーの中央に置く。右側のボタンが多くて 1 行では中央に置けない幅のときは、
+        #     ページめくりを 1 段上の行の中央に移す（_layout_bottom_bar）
+        self._bottom_bar = QWidget()
+        self._bottom_grid = QGridLayout(self._bottom_bar)
+        # 左右の余白を同じにして、バーの中央＝詳細画面の中央にする
+        self._bottom_grid.setContentsMargins(24, 6, 24, 18)
+        # 列の間隔は 0 にする（中身の無い左の列の横には間隔が付かず、左右がずれるため）
+        self._bottom_grid.setHorizontalSpacing(0)
+        self._bottom_grid.setVerticalSpacing(6)
+        self._bottom_two_rows = None
+
+        self._nav_box = QWidget()
+        nav_bar = QHBoxLayout(self._nav_box)
+        nav_bar.setContentsMargins(0, 0, 0, 0)
+        nav_bar.setSpacing(10)
+        # 右側のボタン: 上の段に「Notionと同期」、下の段に「編集」または「保存」「取消」
+        self._action_box = QWidget()
+        action_rows = QVBoxLayout(self._action_box)
+        action_rows.setContentsMargins(0, 0, 0, 0)
+        action_rows.setSpacing(6)
+        notion_row = QHBoxLayout()
+        notion_row.setContentsMargins(0, 0, 0, 0)
         btn_bar = QHBoxLayout()
-        btn_bar.setContentsMargins(0, 6, 0, 0)
+        btn_bar.setContentsMargins(0, 0, 0, 0)
         btn_bar.setSpacing(10)
+        action_rows.addLayout(notion_row)
+        action_rows.addLayout(btn_bar)
+        self._action_spacing = btn_bar.spacing()
 
         # ページめくりボタン群
         self.prev_btn = QPushButton("◀  前の書物")
@@ -939,7 +1015,7 @@ class ItemDetailDialog(QDialog):
             }}
         """)
         self.prev_btn.clicked.connect(self._go_prev)
-        btn_bar.addWidget(self.prev_btn)
+        nav_bar.addWidget(self.prev_btn)
 
         self.page_indicator = QLabel("―  1 / 1 冊  ―")
         self.page_indicator.setAlignment(Qt.AlignCenter)
@@ -950,7 +1026,7 @@ class ItemDetailDialog(QDialog):
             font-weight: bold;
             padding: 0 8px;
         """)
-        btn_bar.addWidget(self.page_indicator)
+        nav_bar.addWidget(self.page_indicator)
 
         self.next_btn = QPushButton("次の書物  ▶")
         self.next_btn.setFixedSize(105, 32)
@@ -977,9 +1053,7 @@ class ItemDetailDialog(QDialog):
             }}
         """)
         self.next_btn.clicked.connect(self._go_next)
-        btn_bar.addWidget(self.next_btn)
-
-        btn_bar.addStretch()
+        nav_bar.addWidget(self.next_btn)
 
         self.edit_btn = QPushButton("✎  編集")
         self.edit_btn.setFixedSize(96, 32)
@@ -1001,6 +1075,37 @@ class ItemDetailDialog(QDialog):
         """)
         self.edit_btn.clicked.connect(self._toggle_edit_mode)
         btn_bar.addWidget(self.edit_btn)
+
+        # Notion から取り込んだシナリオだけ、編集中に Notion の最新の内容を取ってこられるようにする
+        self.notion_sync_btn = QPushButton("📓  Notionと同期")
+        self.notion_sync_btn.setFixedSize(186, 30)  # 下の段の「保存」「取消」と同じ幅
+        self.notion_sync_btn.setCursor(Qt.PointingHandCursor)
+        self.notion_sync_btn.setToolTip("Notion から最新の内容を取得し、手元の内容と比べて反映する項目を選べます")
+        self.notion_sync_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #1d1a16;
+                color: {Theme.TEXT_WHITE};
+                border: 1px solid {Theme.BRASS_BASE};
+                border-radius: 2px;
+                font-size: 12px;
+                font-family: {Theme.FONT_SERIF};
+            }}
+            QPushButton:hover {{
+                background-color: #2c251d;
+                border: 1px solid {Theme.BRASS_LIGHT};
+                color: #ffffff;
+            }}
+            QPushButton:disabled {{
+                color: {Theme.TEXT_MUTED};
+                border: 1px solid #4a3a2a;
+            }}
+        """)
+        self.notion_sync_btn.clicked.connect(self._on_notion_sync_clicked)
+        self.notion_sync_btn.hide()
+        notion_row.addStretch()
+        notion_row.addWidget(self.notion_sync_btn)
+        self._notion_fetch_task = None
+        self._discard_task = None
 
         self.save_btn = QPushButton("💾  保存")
         self.save_btn.setFixedSize(96, 32)
@@ -1044,8 +1149,10 @@ class ItemDetailDialog(QDialog):
         self.cancel_btn.hide()
         btn_bar.addWidget(self.cancel_btn)
 
-        right_main_layout.addLayout(btn_bar)
         dialog_layout.addWidget(right_container, 1)
+
+        # 下部バーは左右の列の下に、詳細画面の幅いっぱいに置く（ページめくりを詳細画面の中央に置くため）
+        root_layout.addWidget(self._bottom_bar)
 
 
     def _create_section_header(self, title_text):
@@ -1094,9 +1201,15 @@ class ItemDetailDialog(QDialog):
             self.cover_label.setText("表紙画像なし")
 
     def _render_tags(self):
-        """タグの描画（区分プレフィックスは書かず、長方形の短辺が丸いボタン＝PillTagで統一表示）"""
-        while self.tags_flow_layout.count():
-            item = self.tags_flow_layout.takeAt(0)
+        """タグの描画（グローバルタグとローカルタグの領域を分け、長方形の短辺が丸いボタン＝PillTagで表示）"""
+        item_tags = self.db.get_item_tags(self.item_id)
+        self.tags_box.setText("、".join(t[1] for t in item_tags) if item_tags else "タグなし")
+        self._fill_tag_flow(self.global_flow_layout, [t for t in item_tags if t[3]], "グローバルタグなし")
+        self._fill_tag_flow(self.tags_flow_layout, [t for t in item_tags if not t[3]], "ローカルタグなし")
+
+    def _fill_tag_flow(self, flow_layout, rows, empty_text):
+        while flow_layout.count():
+            item = flow_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
             elif item.layout():
@@ -1104,27 +1217,20 @@ class ItemDetailDialog(QDialog):
                     sub = item.layout().takeAt(0)
                     if sub.widget():
                         sub.widget().deleteLater()
-
-        item_tags = self.db.get_item_tags(self.item_id)
-        all_tags = [t[1] for t in item_tags]
-        if all_tags:
-            self.tags_box.setText("、".join(all_tags))
-            row_layout = None
-            for i, tag_row in enumerate(item_tags):
-                tid, tname, tcolor, is_glob = tag_row
-                if i % 2 == 0:
-                    row_layout = QHBoxLayout()
-                    row_layout.setSpacing(6)
-                    self.tags_flow_layout.addLayout(row_layout)
-                pill = PillTag(tname, color=tcolor, is_checkable=False)
-                row_layout.addWidget(pill)
-            if len(item_tags) % 2 != 0 and row_layout is not None:
-                row_layout.addStretch()
-        else:
-            self.tags_box.setText("タグなし")
-            empty_lbl = QLabel("タグなし")
+        if not rows:
+            empty_lbl = QLabel(empty_text)
             empty_lbl.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 11px; padding: 4px;")
-            self.tags_flow_layout.addWidget(empty_lbl)
+            flow_layout.addWidget(empty_lbl)
+            return
+        row_layout = None
+        for i, (_tid, tname, tcolor, _is_glob) in enumerate(rows):
+            if i % 2 == 0:
+                row_layout = QHBoxLayout()
+                row_layout.setSpacing(6)
+                flow_layout.addLayout(row_layout)
+            row_layout.addWidget(PillTag(tname, color=tcolor, is_checkable=False))
+        if len(rows) % 2 != 0 and row_layout is not None:
+            row_layout.addStretch()
 
     def _load_values(self, force_edit_inputs=False):
         """データベースから最新値をロードして表示。
@@ -1192,7 +1298,15 @@ class ItemDetailDialog(QDialog):
         notion_page_id = self.db.get_notion_page_id(self.item_id)
         notion_url = self.db.get_notion_url(self.item_id)
         is_notion = bool(notion_page_id) or bool(notion_url) or (file_path and file_path.startswith("notion://"))
-        if is_notion:
+        notion_deleted = not notion_page_id and bool(self.db.get_notion_deleted_page_id(self.item_id))
+        if notion_deleted:
+            # Notion 側でページが削除されたため連携を外した本（リンク先はもう無い）
+            self.notion_link_label.hide()
+            if hasattr(self, "notion_copy_btn"):
+                self.notion_copy_btn.hide()
+            self.notion_status_edit_lbl.setText("📓 Notion連携: Notion 側でページが削除されたため、連携を外しています")
+            self.notion_status_edit_lbl.show()
+        elif is_notion:
             if not notion_url:
                 clean_nid = (notion_page_id or file_path.replace("notion://", "")).replace("-", "").strip()
                 if clean_nid:
@@ -1209,6 +1323,8 @@ class ItemDetailDialog(QDialog):
             if hasattr(self, "notion_copy_btn"):
                 self.notion_copy_btn.hide()
             self.notion_status_edit_lbl.hide()
+
+        self._update_notion_sync_button()
 
         # 1. ファイルウィジェットの表示
         if has_file:
@@ -1235,14 +1351,14 @@ class ItemDetailDialog(QDialog):
             self.view_add_domain_btn.hide()
             self.web_item_widget.hide()
 
-        # 3. Notion情報元ウィジェットの表示
-        if is_notion:
+        # 3. Notion情報元ウィジェットの表示（Notion 側で削除され連携を外した本は出さない）
+        if is_notion and not notion_deleted:
             self.notion_item_widget.show()
         else:
             self.notion_item_widget.hide()
 
         # 4. 情報元が一切ない場合の未設定表示
-        has_any = has_file or has_web or is_notion
+        has_any = has_file or has_web or (is_notion and not notion_deleted)
         self.none_source_label.setVisible(not has_any)
 
         # タグの描画
@@ -1254,7 +1370,7 @@ class ItemDetailDialog(QDialog):
         if hasattr(self, "title_bar"):
             self.title_bar.setTitle(win_title)
 
-        # 冒険録（セッション記録）一覧を描画
+        # セッション履歴（セッション記録）一覧を描画
         self._render_play_logs()
 
     def _center_on_parent_window(self, target_w=None, target_h=None):
@@ -1426,6 +1542,8 @@ class ItemDetailDialog(QDialog):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # 下部バーの幅は、ダイアログの大きさが変わった後のレイアウトで決まるため、その後で並べ直す
+        QTimer.singleShot(0, self._layout_bottom_bar)
         if hasattr(self, "_save_geom_timer") and not self.isMaximized():
             self._save_geom_timer.start(400)
 
@@ -1755,10 +1873,73 @@ class ItemDetailDialog(QDialog):
         # 左パネルの表紙変更・タグ編集ボタンの表示切替（編集画面に統一）
         self.change_cover_btn.setVisible(self.is_edit_mode)
         self.edit_tags_btn.setVisible(self.is_edit_mode)
+        self.edit_global_tags_btn.setVisible(self.is_edit_mode)
+        self.discard_btn.setVisible(self.is_edit_mode)
 
         self.edit_btn.setVisible(not self.is_edit_mode)
         self.save_btn.setVisible(self.is_edit_mode)
         self.cancel_btn.setVisible(self.is_edit_mode)
+        self._update_notion_sync_button()
+
+        # セッション履歴の追加・編集・削除は編集画面でだけ行う
+        self.add_playlog_btn.setVisible(self.is_edit_mode)
+        self._render_play_logs()
+
+    def _layout_bottom_bar(self):
+        """ページめくり（冊数の表示）を下部バー＝詳細画面の中央に置く。
+
+        1 行に並べると中央に置けない幅（右側のボタンが多い編集画面など）のときは、
+        ページめくりを 1 段上の行の中央に、ボタンをその下の行の右端に置く。
+        """
+        if not hasattr(self, "_bottom_grid"):
+            return
+        grid = self._bottom_grid
+        spacing = self._action_spacing
+        buttons = [b for b in (self.edit_btn, self.save_btn, self.cancel_btn) if not b.isHidden()]
+        actions_w = sum(b.width() for b in buttons) + spacing * max(0, len(buttons) - 1)
+        if not self.notion_sync_btn.isHidden():  # 「Notionと同期」は上の段に置く
+            actions_w = max(actions_w, self.notion_sync_btn.width())
+        nav_w = self._nav_box.sizeHint().width()
+        margins = self._bottom_grid.contentsMargins()
+        available = (self._bottom_bar.width() or self._bottom_bar.sizeHint().width()) - margins.left() - margins.right()
+        two_rows = available < nav_w + 2 * (actions_w + spacing)
+
+        if two_rows != self._bottom_two_rows:
+            grid.removeWidget(self._nav_box)
+            grid.removeWidget(self._action_box)
+            if two_rows:
+                grid.addWidget(self._nav_box, 0, 0, 1, 3, Qt.AlignHCenter)
+                grid.addWidget(self._action_box, 1, 0, 1, 3, Qt.AlignRight)
+            else:
+                # ページめくりは「保存」「取消」の段（下の段）にそろえる
+                grid.addWidget(self._nav_box, 0, 1, Qt.AlignHCenter | Qt.AlignBottom)
+                grid.addWidget(self._action_box, 0, 2, Qt.AlignRight | Qt.AlignBottom)
+            self._bottom_two_rows = two_rows
+        # 1 行のときは左右の列を同じ幅にして、真ん中の列（ページめくり）を中央に保つ
+        side = 0 if two_rows else actions_w
+        for col in (0, 2):
+            grid.setColumnMinimumWidth(col, side)
+            grid.setColumnStretch(col, 0 if two_rows else 1)
+        grid.setColumnStretch(1, 0)
+
+    def _notion_page_id_for_sync(self):
+        """この本が取り込まれた Notion のページ（無ければ空文字）"""
+        page_id = self.db.get_notion_page_id(self.item_id) or ""
+        if not page_id and self.db.get_notion_deleted_page_id(self.item_id):
+            return ""  # Notion 側でページが削除され、連携を外した本
+        if not page_id:
+            it = self.db.get_item(self.item_id)
+            file_path = (it[1] if it and len(it) > 1 else "") or ""
+            if file_path.startswith("notion://"):
+                page_id = file_path[len("notion://"):].strip()
+        return page_id
+
+    def _update_notion_sync_button(self):
+        """「Notionと同期」は、Notion から取り込んだ本を編集しているときだけ出す"""
+        if not hasattr(self, "notion_sync_btn"):
+            return
+        self.notion_sync_btn.setVisible(self.is_edit_mode and bool(self._notion_page_id_for_sync()))
+        self._layout_bottom_bar()
 
     def _on_cancel(self):
         """編集の取消（破棄して閲覧モードへ戻す）"""
@@ -1841,7 +2022,7 @@ class ItemDetailDialog(QDialog):
                     parent_dir = os.path.dirname(norm_path)
                     QDesktopServices.openUrl(QUrl.fromLocalFile(parent_dir))
         except Exception as e:
-            QMessageBox.warning(self, "エラー", f"フォルダを開く際にエラーが発生しました:\n{e}")
+            show_error(self, f"シナリオのフォルダを開く（{norm_path}）", "フォルダを開く際にエラーが発生しました", exc=e)
 
     def _on_url_clicked(self):
         raw_url = self.db.get_source_url(self.item_id)
@@ -1861,7 +2042,7 @@ class ItemDetailDialog(QDialog):
             else:
                 QMessageBox.information(self, "案内", f"Webブラウザで開けない形式のURLです:\n{url}")
         except Exception as e:
-            QMessageBox.warning(self, "警告", f"URLの検証中にエラーが発生しました: {e}")
+            show_error(self, f"URL を開く（{url}）", "URL の検証中にエラーが発生しました", exc=e)
 
     def _get_effective_notion_url(self):
         """共有可能なNotionグローバルURLを取得する"""
@@ -1894,7 +2075,7 @@ class ItemDetailDialog(QDialog):
         try:
             QDesktopServices.openUrl(QUrl(notion_url))
         except Exception as e:
-            QMessageBox.warning(self, "エラー", f"Notionページを開けませんでした: {e}")
+            show_error(self, f"Notion ページを開く（{notion_url}）", "Notion ページを開けませんでした", exc=e)
 
     def _on_copy_notion_link(self):
         """Notion共有リンクをクリップボードにコピーする"""
@@ -1919,13 +2100,19 @@ class ItemDetailDialog(QDialog):
 
     def _on_edit_tags(self):
         """ローカルタグ設定ダイアログを開く（自由タグの複数チェック・追加）"""
-        dlg = MultiTagEditDialog(self.item_id, self.db, self)
+        self._edit_item_tags(is_global=False)
+
+    def _on_edit_global_tags(self):
+        """グローバルタグ設定ダイアログを開く（グローバルタグ一覧から選択）"""
+        self._edit_item_tags(is_global=True)
+
+    def _edit_item_tags(self, is_global):
+        """別ウィンドウのタグ一覧で選んだ側（グローバル/ローカル）のタグだけを更新し、もう一方は維持する"""
+        dlg = MultiTagEditDialog(self.item_id, self.db, self, is_global=is_global)
         if dlg.exec() == QDialog.Accepted:
-            selected_local_ids = set(dlg.get_selected_tag_ids())
-            # 現在のグローバルタグを維持し、ローカルタグのみを更新
-            current_global_ids = {t[0] for t in self.db.get_item_tags(self.item_id, is_global=True)}
-            all_ids = list(current_global_ids | selected_local_ids)
-            self.db.set_item_tags(self.item_id, all_ids)
+            selected_ids = set(dlg.get_selected_tag_ids())
+            other_ids = {t[0] for t in self.db.get_item_tags(self.item_id, is_global=not is_global)}
+            self.db.set_item_tags(self.item_id, list(other_ids | selected_ids))
             self._render_tags()
             self.item_updated.emit(self.item_id)
 
@@ -1969,7 +2156,8 @@ class ItemDetailDialog(QDialog):
 
     def _on_web_fetch_failed(self, error):
         self._reset_fetch_web_button()
-        QMessageBox.warning(self, "取得エラー", f"Web情報の取得に失敗しました:\n{error}")
+        show_error(self, f"Web から情報を取得する（{self.url_edit.text().strip()}）", "Web 情報の取得に失敗しました",
+                   exc=error, title="取得エラー")
 
     def _apply_fetched_web_info(self, data, target_id=None):
         """取得した Web 情報を更新前の情報と比較し、選ばれた項目を入力欄に反映する"""
@@ -2002,41 +2190,7 @@ class ItemDetailDialog(QDialog):
                 QMessageBox.information(self, "案内", "反映対象として選択された項目はありませんでした。")
                 return
 
-            updated_fields = []
-            if "title" in selected_fields and data.get("title"):
-                self.edit_inputs["title"].setText(data["title"])
-                updated_fields.append("タイトル")
-
-            if "author" in selected_fields and data.get("author"):
-                self.edit_inputs["author"].setText(data["author"])
-                updated_fields.append("作者")
-
-            if "system" in selected_fields and data.get("system"):
-                self.edit_inputs["system"].setText(data["system"])
-                updated_fields.append("システム")
-
-            if "players" in selected_fields and data.get("players"):
-                self.edit_inputs["players"].setText(data["players"])
-                updated_fields.append("プレイ人数")
-
-            if "duration" in selected_fields and data.get("duration"):
-                self.edit_inputs["duration"].setText(data["duration"])
-                updated_fields.append("プレイ時間")
-
-            if "overview" in selected_fields and data.get("overview"):
-                self.overview_edit.setPlainText(data["overview"])
-                updated_fields.append("概要")
-
-            if "synopsis" in selected_fields and data.get("synopsis"):
-                self.synopsis_edit.setPlainText(data["synopsis"])
-                updated_fields.append("あらすじ")
-
-            if "cover" in selected_fields and data.get("image_bytes"):
-                pix = QPixmap()
-                if pix.loadFromData(QByteArray(data["image_bytes"])) and not pix.isNull():
-                    self._temp_thumb_bytes = data["image_bytes"]
-                    self.cover_label.setPixmap(pix.scaled(262, 177, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                    updated_fields.append("表紙画像")
+            updated_fields = self._apply_selected_fetched_fields(data, selected_fields)
 
             if updated_fields:
                 QMessageBox.information(
@@ -2045,9 +2199,226 @@ class ItemDetailDialog(QDialog):
                     "選択された以下のWeb情報を入力欄に反映しました：\n・" + "\n・".join(updated_fields) + "\n\n※右下の［✓ 保存］ボタンを押すと変更が確定されます。",
                 )
         except Exception as e:
-            QMessageBox.warning(self, "取得エラー", f"Web情報の取得に失敗しました:\n{e}")
+            show_error(self, f"Web から取得した情報を反映する（{self.url_edit.text().strip()}）",
+                       "Web 情報の反映に失敗しました", exc=e, title="取得エラー")
         finally:
             self._reset_fetch_web_button()
+
+    def _on_discard_clicked(self):
+        """シナリオを書架から破棄する。Notion から取り込んだ本は、Notion のページを残すか捨てるかも尋ねる"""
+        if self._discard_task is not None:
+            return
+        item = self.db.get_item_detail_dict(self.item_id) or {}
+        title = item.get("title") or "無題"
+        page_id = self._notion_page_id_for_sync()
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("シナリオの破棄")
+        text = f"『{title}』を破棄しますか？\nセッション履歴（通過記録）などの記録も、手元から消えます。\n（元のPDFなどのファイル自体は削除されません）"
+        if page_id:
+            text += "\n\nこの本は Notion から取り込まれています。Notion のページをどうしますか？"
+        box.setText(text)
+        local_btn = box.addButton("手元だけ破棄" if page_id else "破棄する", QMessageBox.AcceptRole)
+        trash_btn = None
+        if page_id:
+            trash_btn = box.addButton("Notion のページもゴミ箱へ", QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("キャンセル", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is local_btn:
+            # 手元だけ破棄した本は、次の同調で Notion から取り込み直さない
+            self._finish_discard(self.item_id, ignore_page=page_id or None)
+        elif trash_btn is not None and clicked is trash_btn:
+            from .notion_sync_dialog import open_notion_connection
+
+            def trash():
+                client = open_notion_connection()[0]
+                client.trash_page(page_id)
+
+            target_id = self.item_id
+            self.discard_btn.setEnabled(False)
+            self.discard_btn.setText("⏳ 破棄中...")
+            self._discard_task = run_async(
+                trash,
+                lambda _r: self._finish_discard(target_id),
+                lambda error: self._on_discard_failed(error, title),
+                owner=self,
+            )
+
+    def _on_discard_failed(self, error, title):
+        self._discard_task = None
+        self.discard_btn.setEnabled(True)
+        self.discard_btn.setText("🗑  このシナリオを破棄")
+        show_error(self, f"Notion のページをゴミ箱へ移す（『{title}』）",
+                   "Notion のページを削除できなかったため、シナリオは破棄していません",
+                   exc=error, title="Notion同期エラー")
+
+    def _finish_discard(self, item_id, ignore_page=None):
+        self._discard_task = None
+        try:
+            self.db.delete_item(item_id, ignore_notion_page=ignore_page)
+        except Exception as e:
+            show_error(self, "シナリオを破棄する", "シナリオを破棄できませんでした", exc=e)
+            return
+        self.item_deleted.emit(item_id)
+        self.accept()
+
+    def _on_notion_sync_clicked(self):
+        """Notion から最新の内容を取得し、手元と比べて反映する項目を選んでもらう（通信は別スレッド）"""
+        page_id = self._notion_page_id_for_sync()
+        if not page_id or self._notion_fetch_task is not None:
+            return
+        from .notion_sync_dialog import fetch_notion_page
+
+        self.notion_sync_btn.setEnabled(False)
+        self.notion_sync_btn.setText("⏳ 取得中...")
+        target_id = self.item_id
+        self._notion_fetch_task = run_async(
+            lambda: fetch_notion_page(page_id),
+            lambda fetched: self._apply_notion_page(fetched, target_id, page_id),
+            lambda error: self._on_notion_fetch_failed(error, target_id),
+            owner=self,
+        )
+
+    def _reset_notion_sync_button(self):
+        self._notion_fetch_task = None
+        self.notion_sync_btn.setEnabled(True)
+        self.notion_sync_btn.setText("📓  Notionと同期")
+
+    def _on_notion_fetch_failed(self, error, target_id):
+        self._reset_notion_sync_button()
+        title = self.db.get_item_detail_dict(target_id).get("title") if target_id else ""
+        show_error(self, f"Notion から情報を取得する（『{title or '無題'}』）", "Notion からの取得に失敗しました",
+                   exc=error, title="Notion同期エラー")
+
+    def _apply_notion_page(self, fetched, target_id, page_id):
+        """Notion から取得した内容を手元と比べ、選ばれた項目を入力欄に反映する"""
+        try:
+            if target_id != self.item_id or not self.is_edit_mode:
+                return  # 取得中に別の書物へめくられた・編集をやめた場合は反映しない
+            values = dict(fetched.get("values") or {})
+            notion_sync.keep_local_system(values, self.edit_inputs["system"].text())
+            notion_sync.keep_local_players(values, self.edit_inputs["players"].text())
+            notion_sync.keep_local_duration(values, self.edit_inputs["duration"].text())
+
+            # 通過記録は Notion から読み込むだけの情報なので、比べずにそのまま取り込む
+            play_log_changed = False
+            if "play_log" in values:
+                play_log_changed = self.db.apply_notion_play_log(self.item_id, page_id, values["play_log"])
+                if play_log_changed:
+                    self._render_play_logs()
+                    self.item_updated.emit(self.item_id)
+
+            current_it = self.db.get_item(self.item_id)
+            curr_thumb = getattr(self, "_temp_thumb_bytes", None) or (current_it[8] if current_it else None)
+            current_data = {
+                "title": self.edit_inputs["title"].text().strip(),
+                "author": self.edit_inputs["author"].text().strip(),
+                "system": self.edit_inputs["system"].text().strip(),
+                "players": self.edit_inputs["players"].text().strip(),
+                "duration": self.edit_inputs["duration"].text().strip(),
+                "overview": self.overview_edit.toPlainText().strip(),
+                "synopsis": self.synopsis_edit.toPlainText().strip(),
+                "tags": [t[1] for t in self.db.get_item_tags(self.item_id)],
+                "thumbnail_bytes": curr_thumb,
+            }
+            notion_data = {
+                "title": values.get("title") or "",
+                "author": values.get("author") or "",
+                "system": values.get("system_name") or "",
+                "players": values.get("players_text") or "",
+                "duration": values.get("duration_text") or "",
+                "overview": values.get("overview") or "",
+                "synopsis": values.get("synopsis") or "",
+                "image_bytes": fetched.get("image_bytes"),
+            }
+            if values.get("tags") is not None:
+                notion_data["tags"] = list(values.get("tags") or [])
+
+            # 情報元の URL は比較画面に無いため、手元が空のときだけ Notion の値を入れる
+            filled = []
+            notion_source = (values.get("source_url") or "").strip()
+            if notion_source and not self.url_edit.text().strip():
+                self.url_edit.setText(notion_source)
+                filled.append("情報元の URL")
+
+            if not self._differs_from_notion(current_data, notion_data):
+                lines = ["手元の内容は Notion と同じです。"]
+                if filled:
+                    lines.append("空欄だった次の項目を入力欄に入れました：\n・" + "\n・".join(filled))
+                if play_log_changed:
+                    lines.append("Notion の通過記録をセッション履歴に取り込みました。")
+                QMessageBox.information(self, "Notionと同期", "\n\n".join(lines))
+                return
+
+            diff_dlg = WebInfoComparisonDialog(current_data, notion_data, parent=self, source_name="Notion")
+            if diff_dlg.exec() != QDialog.Accepted:
+                return
+            selected_fields = diff_dlg.get_selected_fields()
+            updated_fields = self._apply_selected_fetched_fields(notion_data, selected_fields) + filled
+
+            if "tags" in selected_fields and "tags" in notion_data:
+                # タグは入力欄が無いため、ここで確定する（同調で取り込むときと同じく Notion のタグにそろえる）
+                self.db.set_tags_from_notion(self.item_id, notion_data["tags"])
+                self._render_tags()
+                self.item_updated.emit(self.item_id)
+
+            lines = []
+            if updated_fields:
+                lines.append("Notion の次の情報を入力欄に反映しました：\n・" + "\n・".join(updated_fields)
+                             + "\n\n※右下の［💾 保存］ボタンを押すと変更が確定されます。")
+            if "tags" in selected_fields and "tags" in notion_data:
+                lines.append("タグを Notion のタグにそろえました（保存しなくても反映済みです）。")
+            if play_log_changed:
+                lines.append("Notion の通過記録をセッション履歴に取り込みました。")
+            if lines:
+                QMessageBox.information(self, "Notionと同期", "\n\n".join(lines))
+            elif not selected_fields:
+                QMessageBox.information(self, "案内", "反映対象として選択された項目はありませんでした。")
+        except Exception as e:
+            show_error(self, f"Notion から取得した情報を反映する（ページ {page_id}）", "Notion の情報の反映に失敗しました",
+                       exc=e, title="Notion同期エラー")
+        finally:
+            self._reset_notion_sync_button()
+
+    @staticmethod
+    def _differs_from_notion(current, notion):
+        for key in ("title", "author", "system", "players", "duration", "overview", "synopsis"):
+            if (notion.get(key) or "").strip() and (current.get(key) or "").strip() != (notion.get(key) or "").strip():
+                return True
+        if "tags" in notion and set(current.get("tags") or []) != set(notion.get("tags") or []):
+            return True
+        new_cover = notion.get("image_bytes")
+        return bool(new_cover and new_cover != current.get("thumbnail_bytes"))
+
+    def _apply_selected_fetched_fields(self, data, selected_fields):
+        """比較画面で選ばれた項目を入力欄（表紙はプレビュー）に反映し、反映した項目名の一覧を返す"""
+        updated_fields = []
+        for key, label in (("title", "タイトル"), ("author", "作者"), ("system", "システム"),
+                           ("players", "プレイ人数"), ("duration", "プレイ時間")):
+            if key in selected_fields and data.get(key):
+                self.edit_inputs[key].setText(data[key])
+                updated_fields.append(label)
+
+        if "overview" in selected_fields and data.get("overview"):
+            self.overview_edit.setPlainText(data["overview"])
+            updated_fields.append("概要")
+
+        if "synopsis" in selected_fields and data.get("synopsis"):
+            self.synopsis_edit.setPlainText(data["synopsis"])
+            updated_fields.append("あらすじ")
+
+        if "cover" in selected_fields and data.get("image_bytes"):
+            pix = QPixmap()
+            if pix.loadFromData(QByteArray(data["image_bytes"])) and not pix.isNull():
+                self._temp_thumb_bytes = data["image_bytes"]
+                self.cover_label.setPixmap(pix.scaled(262, 177, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                updated_fields.append("表紙画像")
+        return updated_fields
 
     def _on_add_domain_clicked(self, target_url=""):
         """現在のURLからドメイン表示設定ダイアログを開いて登録"""
@@ -2071,98 +2442,95 @@ class ItemDetailDialog(QDialog):
             )
 
     # -------------------------------------------------------------------------
-    # 冒険録（プレイ履歴・セッション記録）
+    # セッション履歴（プレイ履歴・セッション記録）
     # -------------------------------------------------------------------------
     def _render_play_logs(self):
-        """冒険録（セッション履歴）一覧を描画"""
+        """セッション履歴一覧を描画"""
         if not hasattr(self, "playlog_layout"):
             return
 
         while self.playlog_layout.count():
             item = self.playlog_layout.takeAt(0)
             if item.widget():
+                item.widget().hide()  # 実際に消えるまでの間も表示に残らないように
                 item.widget().deleteLater()
 
         logs = self.db.get_play_logs(self.item_id)
         if not logs:
-            empty_lbl = QLabel("（まだ冒険録は記されていません。「＋ 記録を追加」からセッションの思い出を記録できます）")
+            hint = "「＋ 記録を追加」" if self.is_edit_mode else "「✎ 編集」"
+            empty_lbl = QLabel(f"（まだセッション履歴はありません。{hint}からセッションの思い出を記録できます）")
+            empty_lbl.setWordWrap(True)
             empty_lbl.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 11px; font-style: italic; padding: 4px 0;")
             self.playlog_layout.addWidget(empty_lbl)
             return
 
         for log in logs:
-            card = QFrame()
-            card.setStyleSheet(f"""
-                QFrame {{
-                    background-color: #16120e;
-                    border: 1px solid #3d2f21;
-                    border-radius: 4px;
-                }}
-            """)
-            c_layout = QVBoxLayout(card)
-            c_layout.setContentsMargins(10, 8, 10, 8)
-            c_layout.setSpacing(6)
+            self.playlog_layout.addWidget(self._make_play_log_card(log))
 
-            # 1行目: 日付・役割バッジ・結果バッジ・キャラクター名・操作ボタン
-            row1 = QHBoxLayout()
-            row1.setSpacing(8)
+    @staticmethod
+    def _play_log_badge(text, color, background="transparent", bold=False):
+        badge = QLabel(f" {text} ")
+        badge.setStyleSheet(f"""
+            background-color: {background};
+            color: {color};
+            border: 1px solid {color};
+            border-radius: 2px;
+            font-size: 10px;
+            {"font-weight: bold;" if bold else ""}
+            padding: 1px 4px;
+        """)
+        return badge
 
-            s_date = log.get("session_date") or "日付未設定"
-            date_lbl = QLabel(f"📅  {s_date}")
-            date_lbl.setStyleSheet(f"color: {Theme.BRASS_LIGHT}; font-weight: bold; font-size: 12px; border: none;")
-            row1.addWidget(date_lbl)
+    def _make_play_log_card(self, log):
+        """セッション履歴 1 件分のカード。見出し（日付・役割・結果）の下に、項目を 1 行ずつ並べる"""
+        card = QFrame()
+        card.setStyleSheet("""
+            QFrame {
+                background-color: #16120e;
+                border: 1px solid #3d2f21;
+                border-radius: 4px;
+            }
+        """)
+        c_layout = QVBoxLayout(card)
+        c_layout.setContentsMargins(10, 8, 10, 8)
+        c_layout.setSpacing(4)
 
-            role = log.get("role") or ""
-            if role:
-                role_bg = "#2b2014" if "GM" in role or "KP" in role else "#152238"
-                role_color = Theme.BRASS_LIGHT if "GM" in role or "KP" in role else "#64b5f6"
-                role_badge = QLabel(f" {role} ")
-                role_badge.setStyleSheet(f"""
-                    background-color: {role_bg};
-                    color: {role_color};
-                    border: 1px solid {role_color};
-                    border-radius: 2px;
-                    font-size: 10px;
-                    padding: 1px 4px;
-                """)
-                row1.addWidget(role_badge)
+        # 見出し: 日付・役割バッジ・結果バッジ・Notion 印（編集画面では編集・削除ボタン）
+        header = QHBoxLayout()
+        header.setSpacing(8)
 
-            result = log.get("result") or ""
-            if result:
-                if "生還" in result or "True" in result:
-                    res_color = "#69db7c"
-                    res_bg = "#1b3320"
-                elif "ロスト" in result:
-                    res_color = "#ff6b6b"
-                    res_bg = "#3a1818"
-                else:
-                    res_color = "#e5c07b"
-                    res_bg = "#2b2014"
-                res_badge = QLabel(f" {result} ")
-                res_badge.setStyleSheet(f"""
-                    background-color: {res_bg};
-                    color: {res_color};
-                    border: 1px solid {res_color};
-                    border-radius: 2px;
-                    font-size: 10px;
-                    font-weight: bold;
-                    padding: 1px 4px;
-                """)
-                row1.addWidget(res_badge)
+        date_lbl = QLabel(f"📅  {log.get('session_date') or '日付未設定'}")
+        date_lbl.setStyleSheet(f"color: {Theme.BRASS_LIGHT}; font-weight: bold; font-size: 12px; border: none;")
+        header.addWidget(date_lbl)
 
-            char_name = log.get("character_name") or ""
-            if char_name:
-                char_lbl = QLabel(f"PC: {char_name}")
-                char_lbl.setStyleSheet("color: #ffffff; font-size: 12px; border: none;")
-                row1.addWidget(char_lbl)
+        role = log.get("role") or ""
+        if role:
+            is_gm = "GM" in role or "KP" in role
+            header.addWidget(self._play_log_badge(
+                role, Theme.BRASS_LIGHT if is_gm else "#64b5f6", "#2b2014" if is_gm else "#152238"))
 
-            row1.addStretch()
+        result = log.get("result") or ""
+        if result:
+            if "生還" in result or "True" in result:
+                res_color, res_bg = "#69db7c", "#1b3320"
+            elif "ロスト" in result:
+                res_color, res_bg = "#ff6b6b", "#3a1818"
+            else:
+                res_color, res_bg = "#e5c07b", "#2b2014"
+            header.addWidget(self._play_log_badge(result, res_color, res_bg, bold=True))
 
-            # 編集・削除ボタン
-            edit_btn = QPushButton("✎")
-            edit_btn.setFixedSize(22, 22)
+        if log.get("notion_page_id"):
+            n_badge = self._play_log_badge("Notion", "#9e9e9e")
+            n_badge.setToolTip("Notion から取り込んだ記録です（Notion 側が変わると次の同調で更新されます）")
+            header.addWidget(n_badge)
+
+        header.addStretch()
+
+        if self.is_edit_mode:
+            edit_btn = QPushButton("✎ 編集")
+            edit_btn.setFixedSize(58, 24)
             edit_btn.setCursor(Qt.PointingHandCursor)
-            edit_btn.setToolTip("この冒険録を編集")
+            edit_btn.setToolTip("このセッション履歴を編集")
             edit_btn.setStyleSheet(f"""
                 QPushButton {{
                     background-color: #221a14;
@@ -2170,6 +2538,7 @@ class ItemDetailDialog(QDialog):
                     border: 1px solid #4a3a2a;
                     border-radius: 2px;
                     font-size: 11px;
+                    padding: 0px;
                 }}
                 QPushButton:hover {{
                     border: 1px solid {Theme.BRASS_LIGHT};
@@ -2177,49 +2546,71 @@ class ItemDetailDialog(QDialog):
                 }}
             """)
             edit_btn.clicked.connect(lambda _, l=log: self._on_edit_play_log(l))
-            row1.addWidget(edit_btn)
+            header.addWidget(edit_btn)
 
-            del_btn = QPushButton("✕")
-            del_btn.setFixedSize(22, 22)
+            del_btn = QPushButton("✕ 削除")
+            del_btn.setFixedSize(58, 24)
             del_btn.setCursor(Qt.PointingHandCursor)
-            del_btn.setToolTip("この冒険録を削除")
-            del_btn.setStyleSheet(f"""
-                QPushButton {{
+            del_btn.setToolTip("このセッション履歴を削除")
+            del_btn.setStyleSheet("""
+                QPushButton {
                     background-color: #2a1515;
                     color: #e57373;
                     border: 1px solid #5a2525;
                     border-radius: 2px;
                     font-size: 11px;
-                }}
-                QPushButton:hover {{
+                    padding: 0px;
+                }
+                QPushButton:hover {
                     border: 1px solid #d32f2f;
                     color: #ffffff;
-                }}
+                }
             """)
             del_btn.clicked.connect(lambda _, lid=log["id"]: self._on_delete_play_log(lid))
-            row1.addWidget(del_btn)
+            header.addWidget(del_btn)
 
-            c_layout.addLayout(row1)
+        c_layout.addLayout(header)
 
-            # 2行目: 卓メンバー
-            members = log.get("party_members") or ""
-            if members:
-                m_lbl = QLabel(f"👥  卓メンバー: {members}")
-                m_lbl.setStyleSheet("color: #b0a090; font-size: 11px; border: none;")
-                c_layout.addWidget(m_lbl)
+        # 項目は 1 行ずつ（長い名前や URL でもカードの幅を広げず、折り返して表示する）
+        def add_line(text, color="#d8ccb8", rich=False):
+            lbl = QLabel(text)
+            lbl.setWordWrap(True)
+            lbl.setTextFormat(Qt.RichText if rich else Qt.PlainText)
+            lbl.setOpenExternalLinks(rich)
+            lbl.setTextInteractionFlags(Qt.TextBrowserInteraction if rich else Qt.TextSelectableByMouse)
+            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lbl.setStyleSheet(f"color: {color}; font-size: 12px; border: none;")
+            c_layout.addWidget(lbl)
+            return lbl
 
-            # 3行目: メモ本文
-            memo = log.get("memo") or ""
-            if memo:
-                memo_lbl = QLabel(memo)
-                memo_lbl.setWordWrap(True)
-                memo_lbl.setStyleSheet("color: #dcd0bd; font-size: 12px; line-height: 1.5; border: none; padding-top: 2px;")
-                c_layout.addWidget(memo_lbl)
+        if log.get("character_name"):
+            add_line(f"🧙  PC: {log['character_name']}", "#ffffff")
+        if log.get("gm"):
+            add_line(f"🎲  GM: {log['gm']}")
+        if log.get("party_members"):
+            add_line(f"👥  卓メンバー: {log['party_members']}")
 
-            self.playlog_layout.addWidget(card)
+        sheet_url = log.get("sheet_url") or ""
+        if sheet_url:
+            if sheet_url.startswith(("http://", "https://")):
+                shown = sheet_url if len(sheet_url) <= 60 else sheet_url[:57] + "…"
+                link = add_line(
+                    f'📜  キャラクターシート: <a href="{html.escape(sheet_url, quote=True)}" '
+                    f'style="color: {Theme.BRASS_LIGHT};">{html.escape(shown)}</a>',
+                    rich=True,
+                )
+                link.setToolTip(sheet_url)
+            else:
+                add_line(f"📜  キャラクターシート: {sheet_url}")
+
+        memo = log.get("memo") or ""
+        if memo:
+            memo_lbl = add_line(memo, "#dcd0bd")
+            memo_lbl.setStyleSheet("color: #dcd0bd; font-size: 12px; line-height: 1.5; border: none; padding-top: 4px;")
+        return card
 
     def _on_add_play_log(self):
-        """新しい冒険録（セッション記録）を追加"""
+        """新しいセッション履歴（セッション記録）を追加"""
         from .play_log_dialog import PlayLogEditDialog
         dlg = PlayLogEditDialog(parent=self)
         if dlg.exec():
@@ -2232,15 +2623,17 @@ class ItemDetailDialog(QDialog):
                 character_name=d["character_name"],
                 result=d["result"],
                 memo=d["memo"],
+                gm=d.get("gm", ""),
+                sheet_url=d.get("sheet_url", ""),
             )
             # 自動で「通過済み」タグを付与
             self.db.toggle_item_tag(self.item_id, "通過済み", enabled=True)
             self._load_values()
             self.item_updated.emit(self.item_id)
-            QMessageBox.information(self, "記録完了", "冒険録を記しました。\n（※ シナリオに『通過済み』タグを付与しました）")
+            QMessageBox.information(self, "記録完了", "セッション履歴を記録しました。\n（※ シナリオに『通過済み』タグを付与しました）")
 
     def _on_edit_play_log(self, log_dict):
-        """既存の冒険録を編集"""
+        """既存のセッション履歴を編集"""
         from .play_log_dialog import PlayLogEditDialog
         dlg = PlayLogEditDialog(log_data=log_dict, parent=self)
         if dlg.exec():
@@ -2253,16 +2646,18 @@ class ItemDetailDialog(QDialog):
                 character_name=d["character_name"],
                 result=d["result"],
                 memo=d["memo"],
+                gm=d.get("gm"),
+                sheet_url=d.get("sheet_url"),
             )
             self._render_play_logs()
             self.item_updated.emit(self.item_id)
 
     def _on_delete_play_log(self, log_id):
-        """冒険録を削除"""
+        """セッション履歴を削除"""
         reply = QMessageBox.question(
             self,
             "削除確認",
-            "この冒険録を削除しますか？",
+            "このセッション履歴を削除しますか？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )

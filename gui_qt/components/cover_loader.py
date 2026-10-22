@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtGui import QImage
 
 from .scenario_card import COVER_CACHE_VERSION, decode_cover, encode_cover, finish_cover, render_cover_base
+from core import error_log
 
 
 class _CoverJob(QRunnable):
@@ -50,7 +51,7 @@ class _CoverJob(QRunnable):
                         unsaved = self._commit(conn)
             self._commit(conn)
         except Exception as e:  # noqa: BLE001
-            print(f"[CoverLoader] {e}")
+            error_log.log_error("表紙画像を読み込む（書架の表示）", "表紙の読み込み処理が止まりました", exc=e)
         finally:
             if conn is not None:
                 conn.close()
@@ -79,7 +80,7 @@ class _CoverJob(QRunnable):
                 return None, False, None
             return finish_cover(base, mode), conflict, (base, row[0])
         except Exception as e:  # noqa: BLE001 - 1件の失敗で他の表紙を止めない
-            print(f"[CoverLoader] item {item_id}: {e}")
+            error_log.log_error(f"表紙画像を読み込む（本の番号 {item_id}）", "表紙画像を表示できませんでした", exc=e)
             return None, False, None
 
     @staticmethod
@@ -96,7 +97,7 @@ class _CoverJob(QRunnable):
             )
             return cur.rowcount
         except sqlite3.Error as e:
-            print(f"[CoverLoader] cache item {item_id}: {e}")
+            error_log.log_error(f"表紙の表示用キャッシュを保存する（本の番号 {item_id}）", "キャッシュを保存できませんでした（表示には影響しません）", exc=e)
             return 0
 
     @staticmethod
@@ -104,7 +105,7 @@ class _CoverJob(QRunnable):
         try:
             conn.commit()
         except sqlite3.Error as e:
-            print(f"[CoverLoader] cache commit: {e}")
+            error_log.log_error("表紙の表示用キャッシュを保存する", "キャッシュを保存できませんでした（表示には影響しません）", exc=e)
         return 0
 
 
