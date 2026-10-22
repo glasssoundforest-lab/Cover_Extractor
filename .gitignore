@@ -14,4 +14,5 @@ __pycache__/
 *.db
 *.db-journal
 /crop_*.png
+/old/scratch/images/
 /preview_qt_prototype.png
