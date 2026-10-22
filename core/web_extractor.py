@@ -8,10 +8,14 @@ import html
 import json
 import os
 import re
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
+
+# 区切り線（「-----」「＊＊＊」「━━━」「☆☆☆」など、記号を3つ以上並べた行）
+SEP_RUN = r"(?:[\-\=＿_~〜～*#+＋─━―ー＊☆★◇◆○●◎・✦✧❖♦♢⋆･·•┈┉┄┅═‐－][ \t　]*){3,}"
 
 
 class OGPHTMLParser(HTMLParser):
@@ -334,7 +338,7 @@ class WebScenarioExtractor:
             body = re.sub(r'</p>', '\n', body, flags=re.IGNORECASE)
             body = re.sub(r'</?(?:[a-zA-Z][a-zA-Z0-9:-]*|!--.*?--)(?:\s+[^>]*)?/?>', '', body, flags=re.DOTALL)
             body = html.unescape(body).strip()
-            body = re.sub(r'\n?[ \t]*[\-\=＿_~〜*]{3,}[ \t]*$', '', body).strip()
+            body = re.sub(r'(?:^|\n)[ \t]*' + SEP_RUN + r'[ \t]*$', '', body).strip()
             body = re.sub(r'[\u200b-\u200f\u202a-\u202e\ufeff]', '', body)
             if heading and body:
                 clean_h = re.sub(r'^[【\[■◆▼●★*#・\-\s]+|[】\]:：\s\-]+$', '', heading).strip()
@@ -359,7 +363,7 @@ class WebScenarioExtractor:
                 raw_body = re.sub(r'</p>', '\n', raw_body, flags=re.IGNORECASE)
                 raw_body = re.sub(r'</?(?:[a-zA-Z][a-zA-Z0-9:-]*|!--.*?--)(?:\s+[^>]*)?/?>', '', raw_body, flags=re.DOTALL)
                 body_text = html.unescape(raw_body).strip()
-                body_text = re.sub(r'\n?[ \t]*[\-\=＿_~〜*]{3,}[ \t]*$', '', body_text).strip()
+                body_text = re.sub(r'(?:^|\n)[ \t]*' + SEP_RUN + r'[ \t]*$', '', body_text).strip()
                 body_text = re.sub(r'[\u200b-\u200f\u202a-\u202e\ufeff]', '', body_text)
                 if clean_h and body_text and len(body_text) < 5000:
                     sections[clean_h] = body_text
@@ -376,7 +380,7 @@ class WebScenarioExtractor:
             raw_desc = re.sub(r'</p>', '\n', raw_desc, flags=re.IGNORECASE)
             raw_desc = re.sub(r'</?(?:[a-zA-Z][a-zA-Z0-9:-]*|!--.*?--)(?:\s+[^>]*)?/?>', '', raw_desc, flags=re.DOTALL)
             t = html.unescape(raw_desc).strip()
-            t = re.sub(r'\n?[ \t]*[\-\=＿_~〜*]{3,}[ \t]*$', '', t).strip()
+            t = re.sub(r'(?:^|\n)[ \t]*' + SEP_RUN + r'[ \t]*$', '', t).strip()
             t = re.sub(r'[\u200b-\u200f\u202a-\u202e\ufeff]', '', t)
             if t:
                 main_desc_candidates.append(t)
@@ -385,6 +389,18 @@ class WebScenarioExtractor:
             main_desc = max(main_desc_candidates, key=len)
 
         return sections, main_desc
+
+    @staticmethod
+    def _strip_trailing_separators(t: str) -> str:
+        """題名末尾の区切り記号（" / " " - " "｜" など）を除く。
+        ただし "黄昏図書館 -禁書の頁-" のような副題を囲むダッシュの閉じ側は残す。"""
+        m = re.search(r'[\s:：／/\-–—|｜║∥│┃#＃]+$', t)
+        if not m:
+            return t
+        run = m.group().strip()
+        if run in ("-", "－", "–", "—", "―", "~", "〜", "～") and re.search(rf'{re.escape(run)}\S', t[:m.start()]):
+            return t[:m.start()].rstrip() + run
+        return t[:m.start()].strip()
 
     @classmethod
     def clean_title(cls, title: str) -> str:
@@ -395,8 +411,10 @@ class WebScenarioExtractor:
 
         # 0. SPLL表記（二次創作ライセンスコード）の除去
         # 例: "SPLL:E197335", "【SPLL:E123456】", "SPLL：E197335", "║SPLL:E197608" など
-        t = re.sub(r'[\s:：／/\-–—|｜║∥│┃]*[【\[［\(（〈《〔]?\s*SPLL[:：\s]*[A-Za-z0-9_-]+.*$', '', t, flags=re.IGNORECASE).strip()
-        t = re.sub(r'[\s:：／/\-–—|｜║∥│┃]+$', '', t).strip()
+        # 括弧の中に SPLL がある場合は括弧ごと除く（例: "灰色の楽園（CoC6版／SPLL:E188888）"）
+        t = re.sub(r'[【\[［\(（〈《〔][^】\]］\)）〉》〕]*SPLL[^】\]］\)）〉》〕]*[】\]］\)）〉》〕]', '', t, flags=re.IGNORECASE).strip()
+        t = re.sub(r'[\s:：／/\-–—|｜║∥│┃#＃]*[【\[［\(（〈《〔]?\s*SPLL[:：\s]*[A-Za-z0-9_-]+.*$', '', t, flags=re.IGNORECASE).strip()
+        t = cls._strip_trailing_separators(t)
 
         # 登録されている全システム名・エイリアスを収集
         sys_tokens = []
@@ -417,6 +435,15 @@ class WebScenarioExtractor:
         ]
         all_noise = sys_tokens + general_tags
         noise_core = "|".join(dict.fromkeys(all_noise))  # 重複除去
+        # 括弧付きの題名の前後に添えられる付記（題名の一部にもなり得るため、括弧の外側の判定にだけ使う）
+        # 例: "CoC「月下の約束」 / 2PL / 本文無料", "《深淵の聖歌隊》CoC7版対応シナリオ"
+        context_tags = [
+            r"本文無料", r"全文無料", r"無料配布", r"有料版?", r"投げ銭", r"新作", r"改訂版", r"完全版",
+            r"R-?18G?", r"R-?15G?", r"両?対応版?", r"版", r"[0-9０-９]+(?:th|版)",
+            r"[\-－~〜～]\s*[A-Za-z0-9][A-Za-z0-9 .'!?&]*\s*[\-－~〜～]",
+            r"(?:HO)?[0-9０-９]+(?:\s*[〜～~\-]\s*[0-9０-９]+)?\s*(?:PL|ＰＬ|人|名)(?:用|向け|専用|固定)?",
+        ]
+        context_core = "|".join(dict.fromkeys(all_noise + context_tags))
 
         # 1. 『...』 や 「...」 や 《...》 が含まれている場合の内外判定
         m = re.search(r"[『「《]([^』」》]+)[』」》]", t)
@@ -425,7 +452,7 @@ class WebScenarioExtractor:
             after = t[m.end():].strip()
             inner = m.group(1).strip()
 
-            noise_pat = rf"^(?:【[^】]*】|\[[^\]]*\]|［[^］]*］|\([^\)]*\)|（[^）]*）|〈[^〉]*〉|{noise_core}|[!！★◆●▼▲\s:：／/\-–—|｜║∥│┃])*$"
+            noise_pat = rf"^(?:【[^】]*】|\[[^\]]*\]|［[^］]*］|\([^\)]*\)|（[^）]*）|〈[^〉]*〉|{context_core}|[!！★◆●▼▲\s:：／/\-–—|｜║∥│┃#＃])*$"
             is_before_noise = not before or bool(re.match(noise_pat, before, re.IGNORECASE))
             is_after_noise = not after or bool(re.match(noise_pat, after, re.IGNORECASE))
 
@@ -469,7 +496,7 @@ class WebScenarioExtractor:
                     for sub in sub_tokens:
                         if cls._guess_system(sub):
                             continue
-                        if sub.lower() in noise_words or re.match(r'^(?:第[0-9０-９]+版|[0-9０-９]+PL|SPLL:.*)$', sub, re.IGNORECASE):
+                        if sub.lower() in noise_words or re.match(rf'^(?:第[0-9０-９]+版|SPLL:.*|{context_core})$', sub, re.IGNORECASE):
                             continue
                         return False
                     return True
@@ -502,6 +529,8 @@ class WebScenarioExtractor:
     @classmethod
     def _extract_players(cls, text: str) -> str:
         """テキストからプレイ人数（例: 2〜4人, 1人（ソロ）, 3人固定, 2PL, 1人～ 等）を抽出する"""
+        # 全角英字（ＰＬ など）を半角にそろえる
+        text = re.sub(r"[Ａ-Ｚａ-ｚ]", lambda c: chr(ord(c.group(0)) - 0xFEE0), text)
         # タイマン(1人)と2PLの併記パターン（例: 2PL/PC＋KPCの一人用タイマンシナリオ, 2PLまたはタイマン, タイマン/2PL）
         taiman_2pl_pat = re.compile(
             r'(?:人数|プレイ人数|推奨人数|PL人数|PL).*?'
@@ -516,13 +545,23 @@ class WebScenarioExtractor:
         if taiman_2pl_pat.search(text):
             return "1～2人"
 
+        # 漢数字の人数（二人、三名 など）を数字にそろえる（「一人」はソロとして下で扱う）
+        text = re.sub(
+            r"(?<![\u4e00-\u9fff])([二三四五六七八九])(?=\s*[人名])",
+            lambda c: str("二三四五六七八九".index(c.group(1)) + 2), text,
+        )
+
+        label = r"[【\[［\(（〈《〔■◆▼●★*#・\-]*\s*(?:推奨人数|プレイ人数|プレイヤー人数|プレイヤー数|プレイヤー|人数|PL人数|PL)[】\]］\)）〉》〕]?[:：　\s]*"
+        # 人数の前に挟まる修飾語（「秘匿 HO 有り」「HO1・HO2の」「KPC＋PL」など）。HO1 のような番号付きの語は人数とみなさず読み飛ばす
+        lead = r"(?:(?:HO|PC)[0-9０-９]+(?![0-9０-９]*\s*(?:人|名|PL|[〜～~\-–/]))|[^\n0-9０-９]){0,25}?"
+        rng = r"[〜～~\-–/]"
         patterns = [
             # 人数見出しに続く修飾語（秘匿HO有り、推奨等）を挟んだ人数抽出（例: ■人数：秘匿 HO 有り 2PL, 〈プレイ人数〉4人固定, 人数　1人～）
-            r"[【\[［\(（〈《〔■◆▼●★*#・\-]*\s*(?:推奨人数|プレイ人数|プレイヤー人数|人数|PL人数|PL)[】\]］\)）〉》〕]?[:：　\s]*(?:[^\n0-9０-９]{0,25}?)([0-9０-９]+(?:\s*[〜～\-–/]\s*[0-9０-９]+)?\s*(?:人|名|PL)(?:用|向け|前後|固定|〜|～)?)",
-            r"[【\[［\(（〈《〔■◆▼●★*#・\-]*\s*(?:推奨人数|プレイ人数|プレイヤー人数|人数|PL人数|PL)[】\]］\)）〉》〕]?[:：　\s]*(?:推定|約|およそ|推奨)?[:：　\s]*(ソロ|1人（タイマン）|タイマン|一人|KPレス|GMレス)",
-            r"([0-9０-９]+(?:\s*[〜～\-–]\s*[0-9０-９]+)\s*[人名](?:用|向け)?)",
-            r"[【\[［\(（〈《〔■◆▼●★*#・\-]*\s*(?:推奨人数|プレイ人数|プレイヤー人数|人数|PL人数|PL)[】\]］\)）〉》〕]?[:：　\s]*(?:[^\n0-9０-９]{0,25}?)([0-9０-９]+)\s*(?:PL|人|名)(?:〜|～)?",
-            r"(?m)^[ \t]*[■◆▼●★・\-]?[ \t]*(?:[0-9０-９]+(?:\s*[〜～\-–/]\s*[0-9０-９]+)?)\s*PL(?:〜|～)?\b",
+            rf"{label}{lead}([0-9０-９]+(?:\s*(?:人|名|PL)?\s*{rng}\s*[0-9０-９]+)?\s*(?:人|名|PL)(?:用|向け|前後|固定|〜|～)?)",
+            rf"{label}(?:推定|約|およそ|推奨)?[:：　\s]*(ソロ|1人（タイマン）|タイマン|一人|KPレス|GMレス)",
+            rf"([0-9０-９]+(?:\s*{rng}\s*[0-9０-９]+)\s*[人名](?:用|向け)?)",
+            rf"{label}{lead}([0-9０-９]+)\s*(?:PL|人|名)(?:〜|～)?",
+            rf"(?m)^[ \t]*[■◆▼●★・\-]?[ \t]*([0-9０-９]+(?:\s*{rng}\s*[0-9０-９]+)?\s*PL(?:〜|～)?)\b",
         ]
         for pat in patterns:
             m = re.search(pat, text, re.IGNORECASE)
@@ -534,6 +573,9 @@ class WebScenarioExtractor:
                 val = val.replace("名", "人")
                 val = re.sub(r'PL', '人', val, flags=re.IGNORECASE)
                 val = re.sub(r'人+', '人', val)
+                val = re.sub(r'\s+', '', val)
+                # 「1人〜2人」は「1〜2人」にそろえる
+                val = re.sub(r'人([〜～~\-–/][0-9])', r'\1', val)
                 if not val.endswith(("人", "固定", "前後", "向け", "用", "タイマン", "〜", "～")):
                     val += "人"
                 return val
@@ -568,7 +610,7 @@ class WebScenarioExtractor:
             spec_candidate = text[:m.end()].strip()
             rest_candidate = text[m.end():].strip()
             # 区切り線などの除去
-            rest_candidate = re.sub(r'^[ \t]*[\-\=＿_~〜*#]{3,}[ \t]*\n?', '', rest_candidate).strip()
+            rest_candidate = re.sub(r'^[ \t]*' + SEP_RUN + r'[ \t]*(?:\n|$)', '', rest_candidate).strip()
 
             # 1. 作者行より前の部分が概要（スペック）内容を含んでいること
             if cls._analyze_section_type(spec_candidate) != "spec":
@@ -614,22 +656,32 @@ class WebScenarioExtractor:
 
         # スペックブロックの直前の行が括弧付きタイトル（「...」や『...』等）の場合、タイトル行をスペックブロックに含める
         story_lines = [l.strip() for l in story_part.splitlines() if l.strip()]
+        # スペックブロックの直前の見出し行（「◇概要◇」など）は物語文に含めない
+        while story_lines and cls._heading_name(story_lines[-1]):
+            story_lines.pop()
+            story_part = "\n".join(story_lines).strip()
         if story_lines and re.match(r'^[「『《【].+[」』》】]$', story_lines[-1]):
             spec_part = story_lines[-1] + "\n" + spec_part
             story_part = "\n".join(story_lines[:-1]).strip()
 
-        # 物語文の前にタイトルや見出しラベル（【概要】など）がある場合、見出し以降を物語文としてトリム
-        m_heading = re.search(rf'(?m)^[ \t]*[{bullet_syms}]*\s*(?:シナリオ概要|作品概要|概要|あらすじ|ストーリー|導入|はじめに)[ \t]*[】\]］\)）〉》〕:]*[ \t]*$', story_part)
-        if m_heading:
-            story_part = story_part[m_heading.end():].strip()
+        # 物語文の前にタイトルや見出しラベル（【概要】「◇あらすじ◇」など）がある場合、見出し以降を物語文としてトリム
+        story_headings = [
+            h for h in cls._find_headings(story_part)
+            if re.search(r'概要|あらすじ|ストーリー|導入|はじめに|シノプシス|story|synopsis|intro', h[2], re.IGNORECASE)
+        ]
+        if story_headings:
+            story_part = story_part[story_headings[0][1]:].strip()
         else:
             # 先頭のシステム名・タイトル行＋装飾線ヘッダーのトリム
-            story_part = re.sub(r'^(?:[ \t]*[^\n]{1,40}\n|[ \t]*\n){1,6}[ \t]*[\-\=＿_~〜*#+＋]{3,}[ \t]*\n?', '', story_part).strip()
+            # （区切り線の前が物語文そのもの（文末の句点を含む）の場合は見出しではないため残す）
+            m_header = re.match(r'^(?:[ \t]*[^\n]{1,40}\n|[ \t]*\n){1,6}[ \t]*' + SEP_RUN + r'[ \t]*\n?', story_part)
+            if m_header and not re.search(r'[。！？!?]', story_part[:m_header.end()]):
+                story_part = story_part[m_header.end():].strip()
             # 先頭の見出し記号トリム
             story_part = re.sub(rf'^[ \t]*[{bullet_syms}]*\s*(?:シナリオ概要|作品概要|概要|あらすじ|ストーリー|はじめに)[ \t]*\n?', '', story_part).strip()
 
         # 物語文末尾の装飾線トリム
-        story_part = re.sub(r'\n?[ \t]*[\-\=＿_~〜*#+＋]{3,}[ \t]*$', '', story_part).strip()
+        story_part = re.sub(r'(?:^|\n)[ \t]*' + SEP_RUN + r'[ \t]*$', '', story_part).strip()
 
         # 物語文の先頭の括弧付きタイトル行、および先頭・末尾の装飾行（「・　・　・」「───」等）を除去
         s_lines = [l.strip() for l in story_part.splitlines()]
@@ -638,9 +690,11 @@ class WebScenarioExtractor:
             s_lines.pop(0)
         if s_lines and re.match(r'^[『《【][^。！？!?]{1,40}[』》】]$', s_lines[0]):
             s_lines.pop(0)
-        while s_lines and deco_line_pat.match(s_lines[0]):
+        def _is_deco(line):
+            return bool(deco_line_pat.match(line) or re.fullmatch(SEP_RUN, line))
+        while s_lines and _is_deco(s_lines[0]):
             s_lines.pop(0)
-        while s_lines and deco_line_pat.match(s_lines[-1]):
+        while s_lines and (_is_deco(s_lines[-1]) or cls._heading_name(s_lines[-1])):
             s_lines.pop()
         story_part = "\n".join(s_lines).strip()
 
@@ -654,7 +708,7 @@ class WebScenarioExtractor:
             r'|ルルブ.*?(?:ですが|どうぞ)|ルールブック.*?(?:ですが|どうぞ)'
             r'|甘いもの市場|presents|非公式.*?企画|参加作品'
             r'|［シナリオ本編にある要素］|【シナリオ傾向】|【特記事項】|【付属内容】|【注意'
-            r'|[\-\=＿_~〜*#+＋─━]{3,}'
+            r'|' + SEP_RUN +
             r')'
         )
         spec_part = spec_trim_pat.split(spec_part)[0].strip()
@@ -674,11 +728,17 @@ class WebScenarioExtractor:
         """テキストから所要時間（例: 3〜4時間, 6時間, 30分, 30分〜1.5時間, 12時間〜 等）を抽出する"""
         qualifiers = r"(?:推定|約|およそ|目安|ボイスセッション|テキストセッション|ボイセ|半テキ|テキセ)?"
         prefix = rf"[【\[［\(（〈《〔]?(?:所要時間|プレイ時間|想定時間|目安時間|時間|セッション時間)[】\]］\)）〉》〕]?[:：\s]*(?:{qualifiers}(?:で|：|:|\s)*)*"
-        h_unit = r"(?:時間|分|[hHｈＨ](?:ours?)?)"
+        # 時間の単位（「4時間半」「テキセ2日」「3h」も含む）
+        h_unit = r"(?:時間半?|分|日|週間|[hHｈＨ](?:ours?)?)"
+        num = r"[0-9０-９]+(?:\.[0-9０-９]+)?"
+        rng = r"[〜～~\-–/]"
+        label = r"(?:所要時間|プレイ時間|想定時間|目安時間|時間|セッション時間)[】\]］\)）〉》〕]?"
         patterns = [
-            rf"{prefix}([0-9０-９]+(?:\.[0-9０-９]+)?\s*(?:時間|分)?\s*[〜～\-–/]\s*[0-9０-９]+(?:\.[0-9０-９]+)?\s*{h_unit}(?:前後)?)",
-            rf"{prefix}([0-9０-９]+(?:\.[0-9０-９]+)?\s*{h_unit}(?:前後|〜|～)?)",
-            r"([0-9０-９]+(?:\.[0-9０-９]+)?\s*(?:時間|分)?\s*[〜～\-–/]\s*[0-9０-９]+(?:\.[0-9０-９]+)?\s*(?:時間|分))",
+            rf"{prefix}({num}\s*{h_unit}?\s*{rng}\s*{num}\s*{h_unit}(?:前後)?)",
+            rf"{prefix}({num}\s*{h_unit}(?:前後|〜|～)?)",
+            # 見出しと数字の間に短い説明が挟まる場合（例: 「プレイ時間：短め（2時間程度）」）
+            rf"{label}\s*[:：][^\n0-9０-９]{{0,15}}?({num}\s*{h_unit}(?:\s*{rng}\s*{num}\s*{h_unit})?)",
+            rf"({num}\s*(?:時間|分)?\s*{rng}\s*{num}\s*(?:時間半?|分))",
         ]
         for pat in patterns:
             m = re.search(pat, text)
@@ -774,7 +834,7 @@ class WebScenarioExtractor:
             spec_part = text[:m.end()].strip()
             rest = text[m.end():].strip()
             # 区切り線などの除去
-            rest = re.sub(r'^[ \t]*[\-\=＿_~〜*#─━―]{3,}[ \t]*\n?', '', rest).strip()
+            rest = re.sub(r'^[ \t]*' + SEP_RUN + r'[ \t]*(?:\n|$)', '', rest).strip()
             # 装飾記号のみの残り（区切り線だけ等）は本文とみなさない
             if rest and not re.fullmatch(r'[\s\-\=＿_~〜*#+＋─━―・·•]*', rest):
                 return spec_part, rest
@@ -786,6 +846,78 @@ class WebScenarioExtractor:
 
         return "", ""
 
+    # 見出しとして扱う語（行の前後の飾り記号を除くと、この語だけが残る行を見出しとみなす）
+    SECTION_KW = (
+        r'(?:あらすじ|ストーリー|シノプシス|イントロダクション|イントロ|トレーラー|導入|プロローグ'
+        r'|story|synopsis|introduction|intro|trailer|prologue'
+        r'|シナリオ概要|作品概要|概要|基本情報|シナリオスペック|シナリオデータ|シナリオ情報|作品情報|スペック|プレイ情報|セッション情報'
+        r'|about|overview|outline|information|info|specs?|data|details?'
+        r'|キャラクター紹介|キャラクター|登場人物|登場NPC|NPC|PC|ハンドアウト|HO|事前HO|公開HO|秘匿HO'
+        r'|資料内容|内容物|ファイル内容|収録内容|同梱物|セット内容|素材内容|データ内容|DL内容|ダウンロード内容'
+        r'|事前注意|注意事項|注意|利用規約|規約|お願い|利用について|配信について|配信ガイドライン|動画配信について|ネタバレについて'
+        r'|プレイ人数|推奨人数|人数|プレイ時間|所要時間|想定時間|時間|推奨技能|推奨PC|舞台|ロスト率|傾向|シナリオ傾向|難易度|推理難易度|形式'
+        r'|作者等の情報|作者情報|制作|スタッフ|クレジット|更新履歴|更新情報|更新|GMをしてくださる方へ|GM向け|作者GM|公認GM|問い合わせ|ショップ|BOOTH'
+        r'|雰囲気|どんなシナリオ|想定している遊び方|要素|同梱内容|権利表記|おすすめ)'
+    )
+    # 強い見出し記号（■◆▋▌）付きの短い行は、見出し語を文中に含むだけでも見出しとみなす（例: 「■こんな探索者/状態におすすめ！」）
+    LOOSE_KW = (
+        r'(?:あらすじ|ストーリー|概要|内容物|同梱|頒布|注意|規約|権利|更新|クレジット'
+        r'|ハンドアウト|キャラクター|登場人物|おすすめ|オススメ|お勧め)'
+    )
+
+    # 見出しの前の飾りと対になる後ろの飾り（「＜あらすじ＞」「≪概要≫」など）
+    _MIRROR = str.maketrans("（(【[［〈《「『＜<≪〔｛{", "）)】]］〉》」』＞>≫〕｝}")
+
+    @staticmethod
+    def _strip_decoration(s: str) -> str:
+        """行の前後の飾り記号（◇ ― ＜＞ ☆ 『』 ━ ： など記号・句読点・空白）を取り除く"""
+        i, j = 0, len(s)
+        while i < j and unicodedata.category(s[i])[0] in "PSZ":
+            i += 1
+        while j > i and unicodedata.category(s[j - 1])[0] in "PSZ":
+            j -= 1
+        return s[i:j]
+
+    @classmethod
+    def _heading_name(cls, line: str) -> str:
+        """行が見出しなら、飾りを除いた見出し名を返す（見出しでなければ空文字）"""
+        s = line.strip()
+        if not s or len(s) > 42:
+            return ""
+        core = cls._strip_decoration(s)
+        if not core:
+            return ""
+        if s[0] in "■◆▋▌" and re.search(cls.LOOSE_KW, s):
+            return core
+        # 後ろの飾りは、閉じ括弧・コロン類か、前の飾りと対になる記号だけを認める
+        # （「・推理難易度★★★☆☆」のような評価表記を見出しと誤認しないため）
+        lead = s[:s.index(core)]
+        trail = s[s.index(core) + len(core):]
+        trail_chars = {c for c in trail if not c.isspace()}
+        if trail_chars:
+            allowed = set(":：】」』）)]］＞>≫〕〉》｝}")
+            allowed |= {c for c in lead + lead.translate(cls._MIRROR) if not c.isspace()}
+            if not trail_chars <= allowed:
+                return ""
+        # 「あらすじ」「◇概要◇」「―STORY―」「【 あらすじ 】」「あらすじ：」
+        # 「あらすじ（ネタバレなし）」のように見出し語の後ろに短い補足が付くものも含む
+        if re.fullmatch(rf'{cls.SECTION_KW}(?:\s*[（(【\[〈《][^）)】\]〉》\n]{{0,20}})?', core, re.IGNORECASE):
+            return core
+        return ""
+
+    @classmethod
+    def _find_headings(cls, text: str) -> list:
+        """テキスト中の見出し行を (行頭位置, 行末位置, 見出し名) の一覧で返す"""
+        found = []
+        pos = 0
+        for line in text.splitlines(keepends=True):
+            body = line.rstrip("\r\n")
+            name = cls._heading_name(body)
+            if name:
+                found.append((pos, pos + len(body), name))
+            pos += len(line)
+        return found
+
     @classmethod
     def _extract_overview_and_synopsis(
         cls, description: str, direct_sections: dict = None, main_desc: str = ""
@@ -796,30 +928,6 @@ class WebScenarioExtractor:
 
         sections = dict(direct_sections) if direct_sections else {}
 
-        # セクション見出しの正規表現（descriptionテキストからのフォールバック切り出し）
-        bullet_syms = r"【\[［\(（〈《〔■◆▼●★*#・▾\-‣▹▸▶▷►◄▋▌▍▎▏█✦✧"
-        section_kw = (
-            r'(?:あらすじ|ストーリー|イントロダクション|イントロ|トレーラー|導入|プロローグ|STORY|Story|INTRODUCTION|Introduction|TRAILER|Trailer|PROLOGUE|Prologue'
-            r'|シナリオ概要|作品概要|概要|基本情報|シナリオスペック|シナリオデータ|シナリオ情報|作品情報|スペック|プレイ情報|セッション情報|ABOUT|About|OVERVIEW|Overview'
-            r'|キャラクター紹介|キャラクター|登場人物|登場NPC|NPC|PC|ハンドアウト|HO|事前HO|公開HO|秘匿HO'
-            r'|資料内容|内容物|ファイル内容|収録内容|同梱物|セット内容|素材内容|データ内容|DL内容|ダウンロード内容'
-            r'|事前注意|注意事項|注意|利用規約|規約|お願い|利用について|配信について|配信ガイドライン|動画配信について|ネタバレについて'
-            r'|プレイ人数|推奨人数|人数|プレイ時間|所要時間|想定時間|時間|推奨技能|推奨PC|舞台|ロスト率|傾向|シナリオ傾向|難易度|推理難易度|形式'
-            r'|作者等の情報|作者情報|制作|スタッフ|クレジット|更新履歴|更新情報|更新|GMをしてくださる方へ|GM向け|作者GM|公認GM|問い合わせ|ショップ|BOOTH|Booth'
-            r'|雰囲気|どんなシナリオ|想定している遊び方|要素|同梱内容|権利表記|おすすめ)'
-        )
-        # 強い見出し記号（■◆▋▌）付きの行で、見出しキーワードを文中に含む短い行（例: 「■こんな探索者/状態におすすめ！」）も見出しとして扱う
-        loose_kw = (
-            r'(?:あらすじ|ストーリー|概要|内容物|同梱|頒布|注意|規約|権利|更新|クレジット'
-            r'|ハンドアウト|キャラクター|登場人物|おすすめ|オススメ|お勧め)'
-        )
-        section_split_pat = re.compile(
-            rf'(?m)^[ \t]*('
-            rf'[{bullet_syms}]*\s*{section_kw}\s*[{bullet_syms}\]】:：\s\-]*'
-            rf'|[■◆▋▌][^\n]{{0,20}}?{loose_kw}[^\n]{{0,20}}'
-            r')[ \t]*$'
-        )
-
         target_texts_for_split = []
         if main_desc:
             target_texts_for_split.append(main_desc)
@@ -827,35 +935,36 @@ class WebScenarioExtractor:
             target_texts_for_split.append(description)
 
         for text_to_split in target_texts_for_split:
-            matches = list(section_split_pat.finditer(text_to_split))
-            if matches:
+            headings = cls._find_headings(text_to_split)
+            if headings:
                 # 最初の見出しの前のテキストからスペックブロックおよび物語文を抽出
-                pre_text = text_to_split[:matches[0].start()].strip()
+                pre_text = text_to_split[:headings[0][0]].strip()
                 if pre_text and "基本情報" not in sections and "概要" not in sections:
                     pre_spec, pre_story = cls._split_narrative_and_spec_block(pre_text)
                     if pre_spec:
                         sections["基本情報"] = pre_spec
-                    if pre_story and "あらすじ" not in sections and "ストーリー" not in sections:
+                    # 本文中に明示的なあらすじ見出しがある場合は、見出し前の文章（キャッチコピー等）をあらすじにしない
+                    has_synopsis_heading = any(
+                        re.search(r'あらすじ|ストーリー|シノプシス|story|synopsis', h[2], re.IGNORECASE) for h in headings
+                    )
+                    if pre_story and not has_synopsis_heading and "あらすじ" not in sections and "ストーリー" not in sections:
                         sections["あらすじ"] = pre_story
-                for i, m in enumerate(matches):
-                    header = m.group(1).strip()
-                    clean_header = re.sub(rf'^[{bullet_syms}\s]+|[{bullet_syms}\s]+$', '', header).strip()
-                    start = m.end()
-                    end = matches[i + 1].start() if i + 1 < len(matches) else len(text_to_split)
-                    content = text_to_split[start:end].strip()
-                    content = re.sub(r'^[ \t]*[\-\=＿_~〜*#+＋]{3,}[ \t]*\n?', '', content).strip()
-                    content = re.sub(r'\n?[ \t]*[\-\=＿_~〜*#+＋]{3,}[ \t]*$', '', content).strip()
-                    content = re.sub(r'[\u200b-\u200f\u202a-\u202e\ufeff]', '', content)
+                for i, (_, h_end, clean_header) in enumerate(headings):
+                    end = headings[i + 1][0] if i + 1 < len(headings) else len(text_to_split)
+                    content = text_to_split[h_end:end].strip()
+                    content = re.sub(r'^[ \t]*' + SEP_RUN + r'[ \t]*(?:\n|$)', '', content).strip()
+                    content = re.sub(r'(?:^|\n)[ \t]*' + SEP_RUN + r'[ \t]*$', '', content).strip()
+                    content = re.sub(r'[​-‏‪-‮﻿]', '', content)
                     if clean_header and content and clean_header not in sections:
                         sections[clean_header] = content
 
         # 各セクション本文の途中に別の見出し（■あらすじ 等）が埋め込まれている場合、その手前で切り詰める
         for sk in list(sections.keys()):
             sv = sections[sk]
-            m_inner = section_split_pat.search(sv)
-            if m_inner and m_inner.start() > 0:
-                trimmed = sv[:m_inner.start()].strip()
-                trimmed = re.sub(r'\n?[ \t]*[\-\=＿_~〜*#+＋─━]{3,}[ \t]*$', '', trimmed).strip()
+            inner = cls._find_headings(sv)
+            if inner and inner[0][0] > 0:
+                trimmed = sv[:inner[0][0]].strip()
+                trimmed = re.sub(r'(?:^|\n)[ \t]*' + SEP_RUN + r'[ \t]*$', '', trimmed).strip()
                 if trimmed:
                     sections[sk] = trimmed
 
@@ -876,14 +985,16 @@ class WebScenarioExtractor:
         main_desc_type = cls._analyze_section_type(main_desc) if main_desc else "neutral"
 
         strong_synopsis_keys = (
-            "あらすじ", "ストーリー", "STORY", "Story",
+            "あらすじ", "ストーリー", "STORY", "Story", "シノプシス", "SYNOPSIS", "Synopsis",
             "イントロダクション", "イントロ", "INTRODUCTION", "Introduction",
             "トレーラー", "TRAILER", "Trailer",
             "導入", "プロローグ", "PROLOGUE", "Prologue"
         )
         strong_spec_keys = (
             "シナリオ情報", "基本情報", "シナリオスペック", "シナリオデータ",
-            "作品情報", "スペック", "プレイ情報", "セッション情報"
+            "作品情報", "スペック", "プレイ情報", "セッション情報",
+            "INFORMATION", "Information", "INFO", "Info", "SPEC", "Spec", "DATA", "Data", "DETAIL", "Detail",
+            "OUTLINE", "Outline"
         )
         spec_field_keys = (
             "プレイ人数", "推奨人数", "人数", "プレイ時間", "所要時間", "想定時間", "時間",
@@ -936,7 +1047,7 @@ class WebScenarioExtractor:
                 from_abbrev = True
 
         # 0-c. 物語本文＋スペックブロックの分割（独立したスペックセクションが存在せず、1つのセクション内に物語とスペックブロックが同居している場合）
-        if not has_strong_spec and not found_overview and not found_synopsis:
+        if not has_strong_spec and not has_strong_synopsis and not found_overview and not found_synopsis:
             # メイン説明文が存在する場合、最優先でチェック
             if main_desc:
                 spec_p, story_p = cls._split_narrative_and_spec_block(main_desc)
@@ -955,7 +1066,7 @@ class WebScenarioExtractor:
                     from_abbrev = True
                     break
 
-        if not has_strong_spec and not found_overview and not found_synopsis and description:
+        if not has_strong_spec and not has_strong_synopsis and not found_overview and not found_synopsis and description:
             spec_p, story_p = cls._split_narrative_and_spec_block(description)
             if spec_p and story_p:
                 found_overview = spec_p
@@ -1063,7 +1174,7 @@ class WebScenarioExtractor:
                 lines = [line.strip() for line in description.splitlines() if line.strip()]
                 filtered_lines = []
                 for l in lines:
-                    if re.match(r'^[\-\=＿_~〜*]{3,}$', l):
+                    if re.match(r'^' + SEP_RUN + r'$', l):
                         continue
                     if re.match(r'^(?:https?://|おかげさまで|ありがとう|更新|BOOTH|DL|ダウンロード)', l):
                         continue
